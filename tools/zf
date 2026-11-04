@@ -1,0 +1,46 @@
+#!/bin/sh
+# zf: ZuneFin helper for your Mac. Wraps Project Lyra's Python tools.
+#
+# Set these once per Terminal window (or put them in ~/.zshrc):
+#   export ZUNE=192.168.1.208          # Zune HD IP
+#   export JF="192.168.1.156 8096"     # Jellyfin IP and port
+#   export JFKEY=...                   # Jellyfin API key
+#   export LYRA=~/project-lyra         # clone of project-lyra (default)
+#
+# usage:
+#   zf ping                 check Lyra answers on the Zune
+#   zf push FILE...         copy files to \flash2\automation on the Zune
+#   zf play [ITEM_ID]       play a random song (or ITEM_ID) with jfplay.exe
+#   zf log                  show jfplay's log and result
+set -e
+LYRA=${LYRA:-$HOME/project-lyra}
+: "${ZUNE:?set ZUNE to the Zune's IP}"
+need_jf() { : "${JF:?set JF to \"<jellyfin-ip> <port>\"}"; : "${JFKEY:?set JFKEY to your Jellyfin API key}"; }
+case "$1" in
+  ping)
+    python3 - "$ZUNE" <<'PY'
+import socket, sys
+s = socket.create_connection((sys.argv[1], 1337), timeout=5); print(s.recv(6).decode().strip() or "no banner"); s.close()
+PY
+    ;;
+  push)
+    shift
+    for f in "$@"; do
+      python3 "$LYRA/tools/general/lyra-write-file.py" "$ZUNE" "$f" "\\flash2\\automation\\$(basename "$f")" --quiet
+      echo "pushed $(basename "$f")"
+    done
+    ;;
+  play)
+    need_jf
+    python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
+      --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY fileurl $2"
+    ;;
+  log)
+    T=$(mktemp -d)
+    python3 "$LYRA/tools/general/lyra-read-file.py" "$ZUNE" '\flash2\zunefin.log' '\flash2\zunefin-out.txt' \
+      --output-dir "$T" --timeout 15 >/dev/null 2>&1 || true
+    cat "$T"/* 2>/dev/null || echo "no log yet"
+    rm -rf "$T"
+    ;;
+  *) sed -n '2,16p' "$0" ;;
+esac
