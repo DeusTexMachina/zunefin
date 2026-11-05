@@ -130,6 +130,9 @@ service when a queued song's location is `jf://<itemId>`.
   raw AAC frames to the decoder with the media type proven by Lyra's YouTube mod
   (MEDIATYPE_Audio, subtype `{0000160A-...}`, WAVEFORMATEX 2 ch / 44.1 kHz).
   `GetBuffer` blocks, which paces playback. EndOfStream at the end advances the queue.
+- The WAVEFORMATEX must match the stream: the filter reads the sample rate and
+  channel count from the first ADTS header (Jellyfin may send 48 kHz; a hard-coded
+  44.1 kHz played it ~8% slow). Confirmed on device.
 - No IMediaSeeking yet, so scrubbing within a song isn't supported.
 - Host-tested: the ADTS splitter reproduces ffmpeg's frames exactly from
   randomly chunked input with leading junk.
