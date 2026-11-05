@@ -1,5 +1,5 @@
 #!/bin/sh
-# zf: ZuneFin helper for your Mac. Wraps Project Lyra's Python tools.
+# zf: ZuneFin helper for your Mac. Wraps the Project Lyra Python tools.
 #
 # Set these once per Terminal window (or put them in ~/.zshrc):
 #   export ZUNE=192.168.1.208          # Zune HD IP
@@ -15,8 +15,13 @@
 #   zf log                  show jfplay's log and result
 set -e
 LYRA=${LYRA:-$HOME/project-lyra}
-: "${ZUNE:?set ZUNE to the Zune's IP}"
-need_jf() { : "${JF:?set JF to \"<jellyfin-ip> <port>\"}"; : "${JFKEY:?set JFKEY to your Jellyfin API key}"; }
+die() { echo "zf: $*" >&2; exit 1; }
+[ -n "$ZUNE" ] || die "set ZUNE to the Zune IP address (export ZUNE=...)"
+need_jf() {
+  [ -n "$JF" ] || die "set JF to the Jellyfin IP and port (export JF=...)"
+  [ -n "$JFKEY" ] || die "set JFKEY to your Jellyfin API key (export JFKEY=...)"
+}
+[ -d "$LYRA/tools" ] || die "no Project Lyra tools at $LYRA (export LYRA=/path/to/project-lyra)"
 case "$1" in
   ping)
     python3 - "$ZUNE" <<'PY'
