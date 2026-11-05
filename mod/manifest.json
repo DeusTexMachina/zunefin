@@ -1,10 +1,10 @@
 {
   "mod_id": "zunefin",
   "name": "ZuneFin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "DeusTexMachina",
   "category": "Media",
-  "description": "Jellyfin music for the Zune HD. Browse your server at http://127.0.0.1:8090 in the Zune browser and play albums through the native player.",
+  "description": "Jellyfin music for the Zune HD. Browse your server at http://127.0.0.1:8090 in the Zune browser; songs stream through the native player.",
   "requires": [
     "lyra.wifi_awake",
     "lyra.mod_runtime@1"
@@ -24,6 +24,54 @@
       "holds": [
         "lyra.wifi_awake"
       ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "jf",
+      "name": "Source Filter",
+      "value_type": "SZ",
+      "value": "{C0FFEE10-2026-4A6E-B0DE-5A554E454649}"
+    },
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "jf",
+      "name": "URL Protocol",
+      "value_type": "SZ",
+      "value": ""
+    },
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "CLSID\\{C0FFEE10-2026-4A6E-B0DE-5A554E454649}",
+      "value_type": "SZ",
+      "value": "ZuneFin Stream Source"
+    },
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "CLSID\\{C0FFEE10-2026-4A6E-B0DE-5A554E454649}",
+      "name": "Merit",
+      "value_type": "DWORD",
+      "value": "0x800002"
+    },
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "CLSID\\{C0FFEE10-2026-4A6E-B0DE-5A554E454649}\\InprocServer32",
+      "value_type": "SZ",
+      "value": "@/zfstream.dll"
+    },
+    {
+      "type": "lyra.registry_write",
+      "hive": "HKCR",
+      "key": "CLSID\\{C0FFEE10-2026-4A6E-B0DE-5A554E454649}\\InprocServer32",
+      "name": "ThreadingModel",
+      "value_type": "SZ",
+      "value": "Both"
     }
   ]
 }

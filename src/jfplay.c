@@ -255,6 +255,40 @@ static void clean_cache(void) {
 }
 
 
+
+/* ===================== streaming source registration ===================== */
+
+#define ZF_CLSID L"{C0FFEE10-2026-4A6E-B0DE-5A554E454649}"
+
+static int reg_sz(HKEY root, const wchar_t *key, const wchar_t *name, const wchar_t *val) {
+    HKEY k; DWORD disp; LONG r;
+    r = RegCreateKeyExW(root, key, 0, NULL, 0, 0, NULL, &k, &disp);
+    if (r) { flog("stream: RegCreateKeyEx(%S) err %ld", key, r); return 0; }
+    r = RegSetValueExW(k, name, 0, REG_SZ, (const BYTE *)val, (DWORD)((wcslen(val) + 1) * sizeof(wchar_t)));
+    RegCloseKey(k);
+    return r == 0;
+}
+
+/* Point the jf: URL scheme at zfstream.dll next to this exe. Returns 1 if streaming is available. */
+static int register_stream(void) {
+    wchar_t dll[MAX_PATH], *slash; HKEY k; DWORD disp, merit = 0x800002; int ok = 1;
+    if (!GetModuleFileNameW(NULL, dll, MAX_PATH)) return 0;
+    slash = wcsrchr(dll, L'\\');
+    if (!slash) return 0;
+    wcscpy(slash + 1, L"zfstream.dll");
+    if (GetFileAttributesW(dll) == 0xFFFFFFFF) { flog("stream: no zfstream.dll next to jfplay.exe, downloading instead"); return 0; }
+    ok &= reg_sz(HKEY_CLASSES_ROOT, L"jf", L"Source Filter", ZF_CLSID);
+    ok &= reg_sz(HKEY_CLASSES_ROOT, L"jf", L"URL Protocol", L"");
+    ok &= reg_sz(HKEY_CLASSES_ROOT, L"CLSID\\" ZF_CLSID, NULL, L"ZuneFin Stream Source");
+    if (RegCreateKeyExW(HKEY_CLASSES_ROOT, L"CLSID\\" ZF_CLSID, 0, NULL, 0, 0, NULL, &k, &disp) == 0) {
+        RegSetValueExW(k, L"Merit", 0, REG_DWORD, (const BYTE *)&merit, 4); RegCloseKey(k);
+    }
+    ok &= reg_sz(HKEY_CLASSES_ROOT, L"CLSID\\" ZF_CLSID L"\\InprocServer32", NULL, dll);
+    ok &= reg_sz(HKEY_CLASSES_ROOT, L"CLSID\\" ZF_CLSID L"\\InprocServer32", L"ThreadingModel", L"Both");
+    flog("stream: jf:// registered -> %S (%s)", dll, ok ? "ok" : "FAILED");
+    return ok;
+}
+
 /* ===================== album mode: native queue ===================== */
 
 typedef int (*CreateSongFn)(DWORD kind, DWORD *out_id);
@@ -371,6 +405,11 @@ static void track_path(const Track *t, wchar_t *out) {
     swprintf(out, L"\\flash2\\zunefin\\%s.mp3", wid);
 }
 
+static void track_loc(const Track *t, wchar_t *out, int stream) {
+    if (stream) { wchar_t wid[48]; MultiByteToWideChar(CP_UTF8, 0, t->id, -1, wid, 48); swprintf(out, L"jf://%s", wid); }
+    else track_path(t, out);
+}
+
 static long download_track(const char *host, int port, const char *key, const Track *t) {
     char p[400]; wchar_t dest[MAX_PATH]; int st; long got;
     _snprintf(p, sizeof p, "/Audio/%s/stream.mp3?audioCodec=mp3&audioBitRate=192000"
@@ -387,7 +426,7 @@ static void attach_art(DWORD song, const wchar_t *art) {
     if (CopyFileW(art, file, FALSE)) ZDK_SETINT((void *)song, 0x10008, 1);
 }
 
-static void album_play(const char *host, int port, const char *key, const char *album_in, const char *start_id) {
+static void album_play(const char *host, int port, const char *key, const char *album_in, const char *start_id, int stream) {
     char path[600], album_id[64] = "", album[160] = "", album_artist[160] = "";
     char *body; int status, n, k, j, have_art = 0, queued = 0;
     HMODULE zdk; PlaySongFromUrlFn play; HANDLE q = NULL;
@@ -452,7 +491,7 @@ static void album_play(const char *host, int port, const char *key, const char *
         }
         if (!have_art) DeleteFileW(ART);
     }
-    {
+    if (!stream) {
         DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[st]);
         flog("dl %d/%d: %ld bytes in %lu ms", st + 1, n, got, GetTickCount() - t0);
         if (got <= 0) { say("download of track %d failed\r\n", st + 1); _snprintf(g_status, sizeof g_status, "Download failed"); return; }
@@ -464,14 +503,15 @@ static void album_play(const char *host, int port, const char *key, const char *
     if (!play) { say("PlaySongFromURL missing\r\n"); return; }
     if (stopping()) return;
     MultiByteToWideChar(CP_UTF8, 0, g_tr[st].name, -1, wt, 200);
-    track_path(&g_tr[st], wp);
+    track_loc(&g_tr[st], wp, stream);
+    flog("play: %s", stream ? "streaming" : "downloaded file");
     status = play(wt, wp);
     flog("play: track %d returned 0x%08x", st + 1, status);
     if (status < 0) { say("player refused track %d (0x%08x)\r\n", st + 1, status); return; }
     Sleep(300);
     set_meta(zdk, have_art ? ART : NULL, g_tr[st].dur_ms, g_tr[st].artist, album);
     say("playing track %d\r\n", st + 1);
-    _snprintf(g_status, sizeof g_status, "Playing %s - %s", album_artist, album);
+    _snprintf(g_status, sizeof g_status, "%s %s - %s", stream ? "Streaming" : "Playing", album_artist, album);
 
     /* 5. create + queue tracks 2..n now; their files download below */
     MultiByteToWideChar(CP_UTF8, 0, album, -1, wb, 160);
@@ -486,7 +526,7 @@ static void album_play(const char *host, int port, const char *key, const char *
                 if (CREATE_SONG(0xfd, &id) < 0 || !id) { flog("queue: create failed at %d", k + 1); break; }
                 MultiByteToWideChar(CP_UTF8, 0, g_tr[k].name, -1, wt, 200);
                 MultiByteToWideChar(CP_UTF8, 0, g_tr[k].artist, -1, wa, 160);
-                track_path(&g_tr[k], wp);
+                track_loc(&g_tr[k], wp, stream);
                 ZDK_SETPROP((void *)id, 0x20001, (DWORD)wt);
                 ZDK_SETPROP((void *)id, 0x2000a, (DWORD)wp);
                 if (wa[0]) ZDK_SETPROP((void *)id, 0x20002, (DWORD)wa);
@@ -510,6 +550,8 @@ static void album_play(const char *host, int port, const char *key, const char *
     if (queued) say("queued %d songs: use next/previous on the Zune\r\n", queued);
     else        say("couldn't add to the Zune's queue (see log); only track 1 will play\r\n");
     flush_out();
+
+    if (stream) { say("streaming: nothing to download\r\n"); return; }
 
     /* 6. download the rest in order, well ahead of playback (~5x real time) */
     for (j = 1; j < n && !stopping(); j++) {
@@ -541,7 +583,7 @@ static int run(const void *arg, int arg_len, void *out, int out_max, int *out_us
     sscanf(a, "%63s %d %79s %15s %63s", host, &port, key, mode, item);
     flog("args: host=%s port=%d mode=%s item=%s", host, port, mode, item);
     if (!host[0] || !key[0]) { say("usage: --arg \"<ip> <port> <api_key> [fileurl|album|file|mp3|static|aac|url] [item_id]\"\r\n"); goto done; }
-    if (!strcmp(mode, "album")) { album_play(host, port, key, item, NULL); goto done; }
+    if (!strcmp(mode, "album")) { album_play(host, port, key, item, NULL, 0); goto done; }
 
     /* 1. pick a song */
     if (item[0]) {

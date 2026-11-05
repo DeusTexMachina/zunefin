@@ -4,3 +4,4 @@ build/
 *.zip
 .DS_Store
 mod/jfplay.exe
+mod/zfstream.dll

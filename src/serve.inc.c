@@ -306,19 +306,20 @@ static void pg_search(Buf *b, const char *q) {
 
 static HANDLE g_worker;
 static char g_req_album[48], g_req_track[48];
+static int g_req_stream, g_can_stream;
 
 static DWORD WINAPI play_worker(LPVOID unused) {
     static char outbuf[4096]; int used = 0;
     (void)unused;
     o_buf = outbuf; o_max = sizeof outbuf; o_used = 0; outbuf[0] = 0;   /* say() target for this run */
     flog("serve: play album=%s track=%s", g_req_album, g_req_track);
-    album_play(g_host, g_port, g_key, g_req_album, g_req_track);
+    album_play(g_host, g_port, g_key, g_req_album, g_req_track, g_req_stream);
     used = o_used; (void)used;
     flush_out();
     return 0;
 }
 
-static void start_playback(const char *album, const char *track) {
+static void start_playback(const char *album, const char *track, int stream) {
     if (g_worker) {                         /* cancel the current album first */
         SetEvent(g_play_stop);
         WaitForSingleObject(g_worker, 20000);
@@ -327,19 +328,28 @@ static void start_playback(const char *album, const char *track) {
     ResetEvent(g_play_stop);
     strncpy(g_req_album, album, sizeof g_req_album - 1); g_req_album[sizeof g_req_album - 1] = 0;
     strncpy(g_req_track, track, sizeof g_req_track - 1); g_req_track[sizeof g_req_track - 1] = 0;
-    _snprintf(g_status, sizeof g_status, "Starting... first song in about 40 s");
+    g_req_stream = stream;
+    _snprintf(g_status, sizeof g_status, stream ? "Starting stream..." : "Starting... first song in about 40 s");
     g_worker = CreateThread(NULL, 0, play_worker, NULL, 0, NULL);
 }
 
 static void pg_play(Buf *b, const char *q) {
-    char album[48], track[48];
+    char album[48], track[48], dl[4]; int stream;
     qparam(q, "album", album, sizeof album); qparam(q, "track", track, sizeof track);
     if (strcmp(album, "random") != 0 && !valid_id(album)) { page_head(b, "play"); b_put(b, "<p>Bad link.</p>", -1); page_foot(b); return; }
     if (track[0] && !valid_id(track)) track[0] = 0;
-    start_playback(album, track);
+    qparam(q, "dl", dl, sizeof dl);
+    stream = g_can_stream && !dl[0];
+    start_playback(album, track, stream);
     page_head(b, "starting");
-    b_put(b, "<p>Downloading the first song. It will start playing in about 40 seconds. "
-             "The rest of the album follows in the Zune's Now Playing queue.</p>", -1);
+    if (stream) {
+        b_put(b, "<p>Streaming: it should start in a few seconds, and the rest of the album is in the Zune's Now Playing queue.</p>", -1);
+        b_printf(b, "<p class=\"s\">No sound? <a href=\"/play?album=%s%s%s&dl=1\">download it instead</a></p>",
+                 album, track[0] ? "&track=" : "", track);
+    } else {
+        b_put(b, "<p>Downloading the first song. It will start playing in about 40 seconds. "
+                 "The rest of the album follows in the Zune's Now Playing queue.</p>", -1);
+    }
     if (strcmp(album, "random") != 0) b_printf(b, "<a class=\"btn\" href=\"/album?id=%s\">back to the album</a>", album);
     page_foot(b);
 }
@@ -456,7 +466,8 @@ static void serve_main(void) {
         flog("serve: can't listen on %d (err %d)", SERVE_PORT, WSAGetLastError());
         return;
     }
-    flog("serve: listening on %d, jellyfin %s:%d", SERVE_PORT, g_host, g_port);
+    g_can_stream = register_stream();
+    flog("serve: listening on %d, jellyfin %s:%d, streaming %s", SERVE_PORT, g_host, g_port, g_can_stream ? "on" : "off");
     for (;;) {
         fd_set rs; struct timeval tv; SOCKET c;
         if (g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0) break;

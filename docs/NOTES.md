@@ -114,3 +114,24 @@ Mods tab and restart.
 Host test: `serve.inc.c` compiles on Linux with a tiny Win32 shim and runs
 against a fake Jellyfin. Note that real Jellyfin JSON is compact (`"Items":[`),
 and the parser relies on that.
+
+## Streaming (jf://)
+
+`zfstream.dll` is a DirectShow source filter (CLSID
+`{C0FFEE10-2026-4A6E-B0DE-5A554E454649}`) registered for the `jf:` URL scheme,
+both by the mod manifest (`lyra.registry_write`, so Lyra resolves `@/zfstream.dll`
+at boot) and by the browse server at startup. zmedia loads it inside the player
+service when a queued song's location is `jf://<itemId>`.
+
+- Load() reads `\flash2\zunefin\config.txt`, requests
+  `/Audio/<id>/stream.aac?audioCodec=aac&audioBitRate=192000&...` (ADTS) over
+  HTTP/1.0, and starts a fetch thread into a 512 KB ring buffer.
+- On Pause, a push thread waits for ~24 KB, then strips ADTS headers and sends
+  raw AAC frames to the decoder with the media type proven by Lyra's YouTube mod
+  (MEDIATYPE_Audio, subtype `{0000160A-...}`, WAVEFORMATEX 2 ch / 44.1 kHz).
+  `GetBuffer` blocks, which paces playback. EndOfStream at the end advances the queue.
+- No IMediaSeeking yet, so scrubbing within a song isn't supported.
+- Host-tested: the ADTS splitter reproduces ffmpeg's frames exactly from
+  randomly chunked input with leading junk.
+- Log: `\flash2\zunefin-stream.log` (`zf slog`). A crash here takes down the
+  player service, so expect a reboot if something goes wrong.
