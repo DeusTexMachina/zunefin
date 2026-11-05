@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stddef.h>
 
 /* ---------- logging ---------- */
 
@@ -52,6 +53,8 @@ static const GUID IID_IPin_             = {0x56a86891,0x0ad4,0x11ce,{0xb0,0x3a,0
 static const GUID IID_IEnumPins_        = {0x56a86892,0x0ad4,0x11ce,{0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70}};
 static const GUID IID_IEnumMediaTypes_  = {0x89c31040,0x846b,0x11ce,{0x97,0xd3,0x00,0xaa,0x00,0x55,0x59,0x5a}};
 static const GUID IID_IMemInputPin_     = {0x56a8689d,0x0ad4,0x11ce,{0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70}};
+static const GUID IID_IMediaSeeking_   = {0x36b73880,0xc2c8,0x11cf,{0x8b,0x46,0x00,0x80,0x5f,0x6c,0xef,0x60}};
+static const GUID TIME_FORMAT_MEDIA_TIME_ = {0x7b785574,0x8c82,0x11cf,{0xbc,0x0c,0x00,0xaa,0x00,0xac,0x74,0xf6}};
 static const GUID MT_Audio  = {0x73647561,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 static const GUID MT_AAC    = {0x0000160a,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 static const GUID FMT_WFX   = {0x05589f81,0xc356,0x11ce,{0xbf,0x01,0x00,0xaa,0x00,0x55,0x59,0x5a}};
@@ -99,6 +102,11 @@ struct Filter {
     SOCKET sock;
     unsigned char *ring; volatile LONG wr, rd; volatile LONG done, err;
     unsigned char wfx[18];
+    void *vMS;                                   /* IMediaSeeking (shared by filter and pin) */
+    char item[48];
+    LONGLONG dur, base;                          /* 100 ns units, same as Jellyfin ticks */
+    volatile LONG frames, discont;
+    CRITICAL_SECTION seek_cs;
     HANDLE hStop, hFetch, hPush;
     wchar_t cur[260];
 };
@@ -106,7 +114,7 @@ typedef struct { void *v; LONG ref; int idx; const unsigned char *wfx; } EnumMT;
 typedef struct { void *v; LONG ref; Filter *f; int idx; } EnumPins;
 typedef struct { void *v; LONG ref; } Factory;
 
-static void *g_FV[15], *g_SV[5], *g_PV[18], *g_EPV[7], *g_EMV[7], *g_CFV[5];
+static void *g_FV[15], *g_SV[5], *g_PV[18], *g_EPV[7], *g_EMV[7], *g_CFV[5], *g_MSV[20];
 static Factory g_factory;
 static Filter *from_fsf(void *o) { return (Filter *)((char *)o - sizeof(void *)); }
 
@@ -130,7 +138,12 @@ static HRESULT EP_Clone(void *o, void **p) { (void)o; *p = 0; return 0x80004001;
 
 /* IPin (output, push model) */
 static ULONG F_AR(void *o);
-static HRESULT P_QI(void *o, const GUID *i, void **out) { Pin *p = o; if (geq(i, &IID_IUnknown_) || geq(i, &IID_IPin_)) { *out = &p->v; InterlockedIncrement(&p->ref); return 0; } *out = 0; return 0x80004002; }
+static HRESULT P_QI(void *o, const GUID *i, void **out) {
+    Pin *p = o;
+    if (geq(i, &IID_IUnknown_) || geq(i, &IID_IPin_)) { *out = &p->v; InterlockedIncrement(&p->ref); return 0; }
+    if (geq(i, &IID_IMediaSeeking_)) { *out = &p->f->vMS; InterlockedIncrement(&p->f->ref); slog("seek: pin QI(IMediaSeeking)"); return 0; }
+    *out = 0; return 0x80004002;
+}
 static ULONG P_AR(void *o) { return InterlockedIncrement(&((Pin *)o)->ref); }
 static ULONG P_RL(void *o) { return InterlockedDecrement(&((Pin *)o)->ref); }
 static HRESULT P_Connect(void *o, void *recv, const AMMT *pmt) {
@@ -179,6 +192,28 @@ static int read_config(char *host, int *port, char *key) {
 }
 
 
+/* Song length in 100 ns ticks from /Items?Ids=<id> ("RunTimeTicks"), 0 if unknown. */
+static LONGLONG fetch_duration(const char *host, int port, const char *key, const char *item) {
+    SOCKET s; struct sockaddr_in a; char req[400], *buf, *q; int n, len = 0; LONGLONG t = 0;
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = inet_addr(host);
+    if (connect(s, (struct sockaddr *)&a, sizeof a)) { closesocket(s); return 0; }
+    n = _snprintf(req, sizeof req, "GET /Items?Ids=%s&EnableImages=false&EnableUserData=false&api_key=%s HTTP/1.0\r\nHost: %s:%d\r\n\r\n", item, key, host, port);
+    send(s, req, n, 0);
+    buf = (char *)malloc(65537);
+    if (!buf) { closesocket(s); return 0; }
+    while (len < 65536 && (n = recv(s, buf + len, 65536 - len, 0)) > 0) len += n;
+    closesocket(s);
+    buf[len] = 0;
+    q = strstr(buf, "\"RunTimeTicks\":");
+    if (q) for (q += 15; *q >= '0' && *q <= '9'; q++) t = t * 10 + (*q - '0');
+    free(buf);
+    slog("load: duration %ld ms", (long)(t / 10000));
+    return t;
+}
+
 /* Read the first ADTS header (fetching a little more if needed) and set this
    filter's WAVEFORMATEX to the stream's real sample rate and channel count. */
 static int read_format(Filter *f) {
@@ -206,7 +241,7 @@ static int read_format(Filter *f) {
 }
 
 /* Connect, send the request, read past the headers. Leftover body bytes go into the ring. */
-static int open_stream(Filter *f, const char *item) {
+static int open_stream(Filter *f, const char *item, LONGLONG start) {
     char host[64], key[80], req[600], hdr[2048], *e; int port, n, hl = 0, code;
     struct sockaddr_in a; WSADATA w;
     if (!read_config(host, &port, key)) { slog("load: no \\flash2\\zunefin\\config.txt"); return 0; }
@@ -216,9 +251,14 @@ static int open_stream(Filter *f, const char *item) {
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = inet_addr(host);
     if (connect(f->sock, (struct sockaddr *)&a, sizeof a)) { slog("load: connect %s:%d err %d", host, port, WSAGetLastError()); return 0; }
-    n = _snprintf(req, sizeof req,
-        "GET /Audio/%s/stream.aac?audioCodec=aac&audioBitRate=192000&audioChannels=2&audioSampleRate=44100&maxAudioSampleRate=44100&api_key=%s HTTP/1.0\r\n"
-        "Host: %s:%d\r\nUser-Agent: ZuneFin-stream/0.1\r\n\r\n", item, key, host, port);
+    if (f->dur == 0) f->dur = fetch_duration(host, port, key, item);
+    {   /* start offset as decimal ticks, without 64-bit printf */
+        char st[24]; int k = 23; unsigned long long v = (unsigned long long)(start > 0 ? start : 0);
+        st[k] = 0; do { st[--k] = (char)('0' + (int)(v % 10)); v /= 10; } while (v && k > 0);
+        n = _snprintf(req, sizeof req,
+            "GET /Audio/%s/stream.aac?audioCodec=aac&audioBitRate=192000&audioChannels=2&audioSampleRate=44100&maxAudioSampleRate=44100&startTimeTicks=%s&api_key=%s HTTP/1.0\r\n"
+            "Host: %s:%d\r\nUser-Agent: ZuneFin-stream/0.1\r\n\r\n", item, st + k, key, host, port);
+    }
     send(f->sock, req, n, 0);
     while (hl < (int)sizeof hdr - 1 && (n = recv(f->sock, hdr + hl, sizeof hdr - 1 - hl, 0)) > 0) {
         hl += n; hdr[hl] = 0;
@@ -295,16 +335,18 @@ static DWORD WINAPI push_thread(LPVOID param) {
         ((HRESULT (*)(void *, unsigned long))VT(samp)[12])(samp, (unsigned long)(flen - hlen));  /* SetActualDataLength */
         ((HRESULT (*)(void *, LONGLONG *, LONGLONG *))VT(samp)[6])(samp, NULL, NULL);            /* SetTime: untimed */
         ((HRESULT (*)(void *, int))VT(samp)[8])(samp, 1);                                         /* SetSyncPoint */
-        if (frames == 0) ((HRESULT (*)(void *, int))VT(samp)[16])(samp, 1);                      /* SetDiscontinuity */
+        if (frames == 0 || InterlockedExchange((LONG *)&f->discont, 0)) ((HRESULT (*)(void *, int))VT(samp)[16])(samp, 1);  /* SetDiscontinuity */
         hr = ((HRESULT (*)(void *, void *))VT(p->mem)[6])(p->mem, samp);                          /* Receive */
         ((ULONG (*)(void *))VT(samp)[2])(samp);
         if (hr) { slog("push: Receive 0x%08lx after %d frames", (unsigned long)hr, frames); break; }
         InterlockedExchange((LONG *)&f->rd, f->rd + flen);
+        InterlockedIncrement((LONG *)&f->frames);
         frames++;
         if (frames == 1 || frames % 2000 == 0) slog("push: %d frames", frames);
     }
     slog("push: end after %d frames (%d resync bytes)", frames, resync);
-    if (p->peer) ((HRESULT (*)(void *))VT(p->peer)[14])(p->peer);                                 /* EndOfStream */
+    if (p->peer && WaitForSingleObject(f->hStop, 0) != WAIT_OBJECT_0)
+        ((HRESULT (*)(void *))VT(p->peer)[14])(p->peer);                                          /* EndOfStream */
     return 0;
 }
 
@@ -328,7 +370,9 @@ static HRESULT FSF_Load(void *o, const wchar_t *name, const AMMT *pmt) {
     item[n] = 0;
     slog("load: jf://%s", item);
     if (n < 8) { slog("load: bad id"); return 0x80070057; }
-    if (!open_stream(f, item)) {
+    strcpy(f->item, item);
+    f->base = 0; f->frames = 0;
+    if (!open_stream(f, item, 0)) {
         if (f->sock != INVALID_SOCKET) { closesocket(f->sock); f->sock = INVALID_SOCKET; }
         return 0x80004005;
     }
@@ -343,6 +387,7 @@ static HRESULT F_QI(void *o, const GUID *i, void **out) {
     Filter *f = o;
     if (geq(i, &IID_IUnknown_) || geq(i, &IID_IPersist_) || geq(i, &IID_IMediaFilter_) || geq(i, &IID_IBaseFilter_)) { *out = &f->vF; InterlockedIncrement(&f->ref); return 0; }
     if (geq(i, &IID_IFileSourceFilter_)) { *out = &f->vFSF; InterlockedIncrement(&f->ref); return 0; }
+    if (geq(i, &IID_IMediaSeeking_)) { *out = &f->vMS; InterlockedIncrement(&f->ref); slog("seek: filter QI(IMediaSeeking)"); return 0; }
     *out = 0; return 0x80004002;
 }
 static ULONG F_AR(void *o) { return InterlockedIncrement(&((Filter *)o)->ref); }
@@ -357,6 +402,7 @@ static ULONG F_RL(void *o) {
     if (r == 0) {
         stop_threads(f);
         if (f->hStop) CloseHandle(f->hStop);
+        DeleteCriticalSection(&f->seek_cs);
         if (f->ring) free(f->ring);
         if (f->pin) LocalFree(f->pin);
         LocalFree(f);
@@ -381,13 +427,82 @@ static HRESULT F_QueryFilterInfo(void *o, FILTERINFO *info) { Filter *f = o; wcs
 static HRESULT F_JoinFilterGraph(void *o, void *g, const wchar_t *n) { (void)n; ((Filter *)o)->graph = g; return 0; }
 static HRESULT F_QueryVendorInfo(void *o, wchar_t **v) { (void)o; *v = 0; return 0x80004001; }
 
+
+/* ---------- IMediaSeeking ---------- */
+
+#define AM_SEEKING_CAPS 0x3F   /* absolute, forwards, backwards, current pos, stop pos, duration */
+static Filter *from_ms(void *o) { return (Filter *)((char *)o - offsetof(Filter, vMS)); }
+
+static LONGLONG cur_pos(Filter *f) {
+    int rate = f->wfx[4] | (f->wfx[5] << 8) | (f->wfx[6] << 16);
+    LONGLONG p;
+    if (rate <= 0) rate = 44100;
+    p = f->base + (LONGLONG)f->frames * 1024 * 10000000 / rate;    /* 1024 samples per AAC frame */
+    return (f->dur && p > f->dur) ? f->dur : p;
+}
+
+/* Jump to `pos`: flush downstream, stop the threads, reopen the stream there, restart. */
+static HRESULT do_seek(Filter *f, LONGLONG pos) {
+    Pin *p = f->pin; int was_running;
+    if (pos < 0) pos = 0;
+    if (f->dur && pos > f->dur - 10000000) pos = f->dur > 10000000 ? f->dur - 10000000 : 0;   /* keep 1 s */
+    EnterCriticalSection(&f->seek_cs);
+    slog("seek: to %ld ms (state %d)", (long)(pos / 10000), f->state);
+    was_running = f->hPush != 0;
+    if (p->peer) ((HRESULT (*)(void *))VT(p->peer)[15])(p->peer);         /* BeginFlush: unblocks GetBuffer/Receive */
+    stop_threads(f);
+    if (p->peer) ((HRESULT (*)(void *))VT(p->peer)[16])(p->peer);         /* EndFlush */
+    ResetEvent(f->hStop);
+    f->wr = 0; f->rd = 0; f->done = 0;
+    f->base = pos; f->frames = 0; f->discont = 1;
+    if (!open_stream(f, f->item, pos)) {
+        slog("seek: reopen failed");
+        if (f->sock != INVALID_SOCKET) { closesocket(f->sock); f->sock = INVALID_SOCKET; }
+        LeaveCriticalSection(&f->seek_cs);
+        return 0x80004005;
+    }
+    f->hFetch = CreateThread(NULL, 0, fetch_thread, f, 0, NULL);
+    if (was_running || f->state != 0) f->hPush = CreateThread(NULL, 0, push_thread, f, 0, NULL);
+    LeaveCriticalSection(&f->seek_cs);
+    return 0;
+}
+
+static HRESULT MS_QI(void *o, const GUID *i, void **out) { return F_QI(&from_ms(o)->vF, i, out); }
+static ULONG MS_AR(void *o) { return InterlockedIncrement(&from_ms(o)->ref); }
+static ULONG MS_RL(void *o) { return F_RL(&from_ms(o)->vF); }
+static HRESULT MS_GetCapabilities(void *o, DWORD *c) { (void)o; *c = AM_SEEKING_CAPS; return 0; }
+static HRESULT MS_CheckCapabilities(void *o, DWORD *c) { (void)o; *c &= AM_SEEKING_CAPS; return *c ? 0 : 1; }
+static HRESULT MS_IsFormatSupported(void *o, const GUID *g) { (void)o; return geq(g, &TIME_FORMAT_MEDIA_TIME_) ? 0 : 1; }
+static HRESULT MS_QueryPreferredFormat(void *o, GUID *g) { (void)o; *g = TIME_FORMAT_MEDIA_TIME_; return 0; }
+static HRESULT MS_GetTimeFormat(void *o, GUID *g) { (void)o; *g = TIME_FORMAT_MEDIA_TIME_; return 0; }
+static HRESULT MS_IsUsingTimeFormat(void *o, const GUID *g) { (void)o; return geq(g, &TIME_FORMAT_MEDIA_TIME_) ? 0 : 1; }
+static HRESULT MS_SetTimeFormat(void *o, const GUID *g) { (void)o; return geq(g, &TIME_FORMAT_MEDIA_TIME_) ? 0 : 0x80004001; }
+static HRESULT MS_GetDuration(void *o, LONGLONG *d) { Filter *f = from_ms(o); if (!f->dur) return 0x80004005; *d = f->dur; return 0; }
+static HRESULT MS_GetStopPosition(void *o, LONGLONG *s) { *s = from_ms(o)->dur; return 0; }
+static HRESULT MS_GetCurrentPosition(void *o, LONGLONG *c) { *c = cur_pos(from_ms(o)); return 0; }
+static HRESULT MS_ConvertTimeFormat(void *o, LONGLONG *t, const GUID *tf, LONGLONG s, const GUID *sf) { (void)o; (void)tf; (void)sf; *t = s; return 0; }
+static HRESULT MS_SetPositions(void *o, LONGLONG *cur, DWORD cf, LONGLONG *stop, DWORD sf) {
+    Filter *f = from_ms(o); DWORD how = cf & 3; LONGLONG target;
+    (void)stop; (void)sf;
+    slog("seek: SetPositions flags 0x%lx", (unsigned long)cf);
+    if (how == 0 || !cur) return 0;                       /* no change to the current position */
+    target = (how == 1) ? *cur : cur_pos(f) + *cur;       /* absolute, or relative/incremental */
+    return do_seek(f, target);
+}
+static HRESULT MS_GetPositions(void *o, LONGLONG *c, LONGLONG *s) { Filter *f = from_ms(o); if (c) *c = cur_pos(f); if (s) *s = f->dur; return 0; }
+static HRESULT MS_GetAvailable(void *o, LONGLONG *e, LONGLONG *l) { Filter *f = from_ms(o); if (e) *e = 0; if (l) *l = f->dur; return 0; }
+static HRESULT MS_SetRate(void *o, double r) { (void)o; return r == 1.0 ? 0 : 0x80004001; }
+static HRESULT MS_GetRate(void *o, double *r) { (void)o; *r = 1.0; return 0; }
+static HRESULT MS_GetPreroll(void *o, LONGLONG *p) { (void)o; *p = 0; return 0; }
+
 static Filter *make_filter(void) {
     Filter *f = (Filter *)LocalAlloc(LPTR, sizeof(Filter));
     Pin *p = (Pin *)LocalAlloc(LPTR, sizeof(Pin));
     unsigned char *ring = (unsigned char *)malloc(RING);
     if (!f || !p || !ring) { if (f) LocalFree(f); if (p) LocalFree(p); if (ring) free(ring); return NULL; }
-    f->vF = g_FV; f->vFSF = g_SV; f->ref = 1; f->pin = p; f->sock = INVALID_SOCKET; f->ring = ring;
+    f->vF = g_FV; f->vFSF = g_SV; f->vMS = g_MSV; f->ref = 1; f->pin = p; f->sock = INVALID_SOCKET; f->ring = ring;
     f->hStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    InitializeCriticalSection(&f->seek_cs);
     memcpy(f->wfx, g_wfx_default, 18);
     p->v = g_PV; p->ref = 1; p->f = f; fill_mt(&p->mt, f->wfx);
     InterlockedIncrement(&g_objs);
@@ -418,8 +533,11 @@ static void init_vtbls(void) {
     void *EP[7]  = {EP_QI, EP_AR, EP_RL, EP_Next, EP_Skip, EP_Reset, EP_Clone};
     void *EM[7]  = {EM_QI, EM_AR, EM_RL, EM_Next, EM_Skip, EM_Reset, EM_Clone};
     void *CF[5]  = {CF_QI, CF_AR, CF_RL, CF_CreateInstance, CF_LockServer};
+    void *MS[20] = {MS_QI, MS_AR, MS_RL, MS_GetCapabilities, MS_CheckCapabilities, MS_IsFormatSupported, MS_QueryPreferredFormat,
+                    MS_GetTimeFormat, MS_IsUsingTimeFormat, MS_SetTimeFormat, MS_GetDuration, MS_GetStopPosition, MS_GetCurrentPosition,
+                    MS_ConvertTimeFormat, MS_SetPositions, MS_GetPositions, MS_GetAvailable, MS_SetRate, MS_GetRate, MS_GetPreroll};
     memcpy(g_FV, F, sizeof F); memcpy(g_SV, S, sizeof S); memcpy(g_PV, P, sizeof P);
-    memcpy(g_EPV, EP, sizeof EP); memcpy(g_EMV, EM, sizeof EM); memcpy(g_CFV, CF, sizeof CF);
+    memcpy(g_EPV, EP, sizeof EP); memcpy(g_EMV, EM, sizeof EM); memcpy(g_CFV, CF, sizeof CF); memcpy(g_MSV, MS, sizeof MS);
     g_factory.v = g_CFV; g_factory.ref = 1;
 }
 

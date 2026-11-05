@@ -133,7 +133,13 @@ service when a queued song's location is `jf://<itemId>`.
 - The WAVEFORMATEX must match the stream: the filter reads the sample rate and
   channel count from the first ADTS header (Jellyfin may send 48 kHz; a hard-coded
   44.1 kHz played it ~8% slow). Confirmed on device.
-- No IMediaSeeking yet, so scrubbing within a song isn't supported.
+- Seeking: the filter and its pin expose IMediaSeeking (media time, 100 ns =
+  Jellyfin ticks). SetPositions flushes downstream (BeginFlush/EndFlush), stops
+  the threads, reopens `/Audio/<id>/stream.aac?...&startTimeTicks=<pos>` and
+  restarts, marking the next sample as a discontinuity. Duration comes from
+  `/Items?Ids=<id>` (RunTimeTicks). EndOfStream is suppressed when a stop was
+  requested, so a seek doesn't advance the queue. Untested on device: does zmedia
+  route scrubbing to the source? Every call is logged as `seek:`.
 - Host-tested: the ADTS splitter reproduces ffmpeg's frames exactly from
   randomly chunked input with leading junk.
 - Log: `\flash2\zunefin-stream.log` (`zf slog`). A crash here takes down the
