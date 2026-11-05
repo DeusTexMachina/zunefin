@@ -701,6 +701,58 @@ done:
     return 0;
 }
 
+
+/* Probe: write every export of a loaded DLL to \flash2\zunefin-exports.txt. */
+static void dump_exports(const wchar_t *dll) {
+    HMODULE m = LoadLibraryW(dll);
+    unsigned char *base = (unsigned char *)m;
+    HANDLE h; DWORD w, i, rva, n, *names; char line[200]; int len;
+    h = CreateFileW(L"\\flash2\\zunefin-exports.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (!m) { len = _snprintf(line, sizeof line, "LoadLibrary failed %lu\r\n", GetLastError()); WriteFile(h, line, len, &w, NULL); CloseHandle(h); return; }
+    {   /* 1. ask for likely names directly: works even for ROM (XIP) modules */
+        static const wchar_t *guess[] = {
+            L"ZDKMedia_Queue_SetPlayPosition", L"ZDKMedia_Queue_SetPosition", L"ZDKMedia_Queue_Seek",
+            L"ZDKMedia_Queue_SeekTo", L"ZDKMedia_Queue_SetPlayPositionMs", L"ZDKMedia_Queue_Scrub",
+            L"ZDKMedia_SetPlayPosition", L"ZDKMedia_Seek", L"ZDKMedia_Queue_GetPlayPosition",
+            L"ZDKMedia_Queue_SetPlayState", L"ZDKMedia_Queue_GetPlayState", L"ZDKMedia_Queue_Next",
+            L"ZDKMedia_Queue_Previous", L"ZDKMedia_Queue_Play", L"ZDKMedia_Queue_Pause",
+            L"ZDKMedia_Queue_GetSongCount", L"ZDKMedia_Queue_MoveTo", L"ZDKMedia_Queue_Clear",
+            L"ZDKMedia_Queue_AddSong", L"ZDKMedia_Queue_InsertSong", L"ZDKMedia_Queue_SetShuffle",
+            L"ZDKMedia_Queue_SetRepeat", NULL };
+        int g;
+        for (g = 0; guess[g]; g++) {
+            FARPROC fp = GetProcAddressW(m, guess[g]);
+            len = _snprintf(line, sizeof line, "%-36S %s\r\n", guess[g], fp ? "FOUND" : "-");
+            WriteFile(h, line, len, &w, NULL);
+        }
+    }
+    /* 2. full export table, only if a readable PE header is really there */
+    if (IsBadReadPtr(base, 0x40) || ((IMAGE_DOS_HEADER *)base)->e_magic != IMAGE_DOS_SIGNATURE ||
+        IsBadReadPtr(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew, sizeof(IMAGE_NT_HEADERS)) ||
+        ((IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew))->Signature != IMAGE_NT_SIGNATURE) {
+        WriteFile(h, "(no PE header in memory: ROM module, full list unavailable)\r\n", 61, &w, NULL);
+        CloseHandle(h); return;
+    }
+    {
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        IMAGE_EXPORT_DIRECTORY *ex;
+        rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        if (!rva) { WriteFile(h, "no export table\r\n", 17, &w, NULL); CloseHandle(h); return; }
+        ex = (IMAGE_EXPORT_DIRECTORY *)(base + rva);
+        n = ex->NumberOfNames;
+        names = (DWORD *)(base + ex->AddressOfNames);
+        len = _snprintf(line, sizeof line, "%S at 0x%08lx: %lu named exports\r\n", dll, (unsigned long)base, n);
+        WriteFile(h, line, len, &w, NULL);
+        for (i = 0; i < n; i++) {
+            len = _snprintf(line, sizeof line, "%s\r\n", (const char *)(base + names[i]));
+            WriteFile(h, line, len, &w, NULL);
+        }
+    }
+    CloseHandle(h);
+}
+
 #ifdef JF_EXE
 #include "serve.inc.c"
 
@@ -713,6 +765,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show) {
     HANDLE h; DWORD w;
     HANDLE mtx;
     (void)hi; (void)hp; (void)show;
+    if (cmdline && !wcsncmp(cmdline, L"exports", 7)) {
+        const wchar_t *d = cmdline + 7;
+        while (*d == L' ') d++;
+        dump_exports(*d ? d : L"zdksystem.dll");
+        return 0;
+    }
     /* one jfplay at a time: ask a running one to stop, then wait for it */
     g_stop = CreateEventW(NULL, TRUE, FALSE, L"ZuneFinStop");
     mtx = CreateMutexW(NULL, FALSE, L"ZuneFinPlayer");

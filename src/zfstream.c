@@ -489,6 +489,9 @@ static HRESULT do_seek(Filter *f, LONGLONG pos) {
     if (f->dur && pos > f->dur - 10000000) pos = f->dur > 10000000 ? f->dur - 10000000 : 0;   /* keep 1 s */
     EnterCriticalSection(&f->seek_cs);
     if (f->frames == 0 && pos == (f->need_open ? f->open_pos : f->base)) { LeaveCriticalSection(&f->seek_cs); return 0; }
+    /* zmedia also sends SetPositions(0) right after playback starts; restarting the
+       stream there only causes a stutter, so ignore a seek to 0 in the first 3 s. */
+    if (pos == 0 && f->base == 0 && !f->need_open && cur_pos(f) < 30000000) { LeaveCriticalSection(&f->seek_cs); return 0; }
     slog("seek: to %ld ms (state %d)", (long)(pos / 10000), f->state);
     active = f->state != 0;
     if (active && p->peer) ((HRESULT (*)(void *))VT(p->peer)[15])(p->peer);   /* BeginFlush: unblocks GetBuffer/Receive */
