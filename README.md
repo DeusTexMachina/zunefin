@@ -14,7 +14,7 @@ Early prototype, driven from a Mac's Terminal.
 - [x] Talk to Jellyfin over Wi-Fi from the Zune
 - [x] Play a song through the native player
 - [x] Title, artist, album, length and cover on Now Playing
-- [ ] Play a whole album, with the next songs downloading in the background
+- [x] Play a whole album as a native queue (next/previous/auto-advance), downloading ahead
 - [ ] Start playback before the whole song has downloaded
 - [ ] A Jellyfin tile on the Start menu for browsing
 
@@ -47,7 +47,8 @@ browser) and a clone of Lyra's tools:
 git clone https://github.com/project-lyra-zune/project-lyra.git ~/project-lyra
 export ZUNE=192.168.1.208 JF="192.168.1.156 8096" JFKEY=your-jellyfin-api-key
 tools/zf push build/jflaunch.dll build/jfplay.exe
-tools/zf play
+tools/zf play          # one random song
+tools/zf album         # a random album (or: tools/zf album ALBUM_ID)
 tools/zf log
 ```
 

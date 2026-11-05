@@ -74,3 +74,25 @@ and set prop `0x10008` to 1. Copy the art into place right after starting playba
   Songs usually return 404 for their own image.
 - Strings contain `\uXXXX` escapes (curly apostrophes and so on); decode them.
 - Durations come as `RunTimeTicks` (100 ns). Parse with integers only.
+
+## Native queue (album mode)
+
+Confirmed working from `jfplay.exe`, a normal user-mode process (the Lyra
+bootstrap makes the privilege global):
+
+1. Play track 1 with `PlaySongFromURL(title, local path)`. It lands at storage
+   index 0 of servicesd's runtime queue (`0x41a525d4`).
+2. For each other track: `create(0xfd, &id)` at `0x4198484c`, set title
+   `0x20001`, location `0x2000a` (the local path the file *will* have), artist,
+   album and duration, then append `id` to the queue's id vector (`+0x60/64/68`)
+   with `WriteProcessMemory` on servicesd.
+3. Write the play order (`+0x6c/70/74`) and cursor (`+0xa4`), then call
+   `ZDKMedia_Queue_MoveTo(0)`.
+4. Copy art for each song id and set has-art.
+
+Songs are queued before their files exist. Downloads run in order at ~50–65 s
+per 4-minute song, so they stay ahead of normal playback. Skipping past the
+downloaded part gives "cannot be played".
+
+Only one jfplay runs at a time (mutex `ZuneFinPlayer`, stop event `ZuneFinStop`).
+A running `.exe` is locked on Windows CE, so restart the Zune if a push fails.
