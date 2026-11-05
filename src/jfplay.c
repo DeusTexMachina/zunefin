@@ -52,6 +52,8 @@ static void flog(const char *fmt, ...) {
 }
 
 static char *o_buf; static int o_max, o_used;
+static HANDLE g_stop;   /* signalled when a newer jfplay wants us gone */
+static int stopping(void) { return g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0; }
 
 /* Write what we have so far to \flash2\zunefin-out.txt (album mode runs for minutes). */
 static void flush_out(void) {
@@ -129,12 +131,13 @@ static long http_download(const char *host, int port, const char *path, const wc
             if (body > 0) { WriteFile(f, e + 4, body, &w, NULL); total += body; }
         } else if (hlen >= 8191) break;
     }
-    while (hdr && (n = recv(s, buf, 8192, 0)) > 0) {
+    while (hdr && !stopping() && (n = recv(s, buf, 8192, 0)) > 0) {
         if (!WriteFile(f, buf, n, &w, NULL) || (int)w != n) { say("write failed (disk full?)\r\n"); total = -1; break; }
         total += n;
         if ((total & 0xFFFFF) < n) flog("dl: %ld KB", total / 1024);
     }
     CloseHandle(f); closesocket(s); free(buf);
+    if (stopping()) { DeleteFileW(dest); return -1; }
     return total;
 }
 
@@ -315,26 +318,31 @@ typedef struct { char id[40]; char name[160]; char artist[160]; int dur_ms; DWOR
 #define MAX_TRACKS 60
 static Track g_tr[MAX_TRACKS];
 
-/* Split the Items array into top-level objects and pull each track's fields. */
+/* Next top-level {...} object in an array at *pp; returns a malloc'd copy or NULL. */
+static char *json_next_obj(const char **pp) {
+    const char *p = *pp, *st; int depth = 0, instr = 0, len; char *obj;
+    while (*p && *p != '{' && *p != ']') p++;
+    if (*p != '{') { *pp = p; return NULL; }
+    st = p;
+    for (; *p; p++) {
+        if (instr) { if (*p == '\\' && p[1]) p++; else if (*p == '"') instr = 0; continue; }
+        if (*p == '"') instr = 1;
+        else if (*p == '{') depth++;
+        else if (*p == '}' && --depth == 0) { p++; break; }
+    }
+    *pp = p;
+    len = (int)(p - st);
+    obj = (char *)malloc(len + 1);
+    if (obj) { memcpy(obj, st, len); obj[len] = 0; }
+    return obj;
+}
+
+/* Pull each track's fields out of an Items array. */
 static int parse_tracks(const char *body) {
-    const char *p = strstr(body, "\"Items\":["), *s; int n = 0;
+    const char *p = strstr(body, "\"Items\":["); int n = 0; char *obj;
     if (!p) return 0;
     p += 9;
-    while (*p && n < MAX_TRACKS) {
-        int depth = 0, instr = 0, len; char *obj;
-        while (*p && *p != '{' && *p != ']') p++;
-        if (*p != '{') break;
-        s = p;
-        for (; *p; p++) {
-            if (instr) { if (*p == '\\' && p[1]) p++; else if (*p == '"') instr = 0; continue; }
-            if (*p == '"') instr = 1;
-            else if (*p == '{') depth++;
-            else if (*p == '}' && --depth == 0) { p++; break; }
-        }
-        len = (int)(p - s);
-        obj = (char *)malloc(len + 1);
-        if (!obj) break;
-        memcpy(obj, s, len); obj[len] = 0;
+    while (n < MAX_TRACKS && (obj = json_next_obj(&p)) != NULL) {
         if (json_str(obj, "Id", g_tr[n].id, sizeof g_tr[n].id)) {
             const char *ar = strstr(obj, "\"Artists\":[\"");
             json_str(obj, "Name", g_tr[n].name, sizeof g_tr[n].name);
@@ -384,13 +392,24 @@ static void album_mode(const char *host, int port, const char *key, const char *
     if (album_in && album_in[0])
         _snprintf(path, sizeof path, "/Items?Ids=%s&api_key=%s", album_in, key);
     else
-        _snprintf(path, sizeof path, "/Items?IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=Random&Limit=1&EnableImages=false&EnableUserData=false&api_key=%s", key);
+        _snprintf(path, sizeof path, "/Items?IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=Random&Limit=10&Fields=ChildCount&EnableImages=false&EnableUserData=false&api_key=%s", key);
     body = http_get(host, port, path, &status);
     if (!body || status != 200) { say("album lookup failed (HTTP %d)\r\n", status); free(body); return; }
     {
-        const char *it = strstr(body, "\"Items\":[");
-        if (it) { json_str(it, "Id", album_id, sizeof album_id); json_str(it, "Name", album, sizeof album);
-                  json_str(it, "AlbumArtist", album_artist, sizeof album_artist); }
+        /* walk the candidates; take the first with 3+ songs, else the first one */
+        const char *p = strstr(body, "\"Items\":["); char *obj; int first = 1;
+        if (p) p += 9;
+        while (p && (obj = json_next_obj(&p)) != NULL) {
+            const char *cc = strstr(obj, "\"ChildCount\":");
+            int good = (album_in && album_in[0]) || (cc && atoi(cc + 13) >= 3);
+            if (first || good) {
+                json_str(obj, "Id", album_id, sizeof album_id); json_str(obj, "Name", album, sizeof album);
+                json_str(obj, "AlbumArtist", album_artist, sizeof album_artist);
+            }
+            first = 0;
+            free(obj);
+            if (good) break;
+        }
     }
     free(body);
     if (!album_id[0]) { say("no album found\r\n"); return; }
@@ -414,10 +433,14 @@ static void album_mode(const char *host, int port, const char *key, const char *
     /* 3. cover (album-level), then the first track */
     {
         char ap[300]; int ast; long ag;
-        _snprintf(ap, sizeof ap, "/Items/%s/Images/Primary?maxWidth=300&maxHeight=300&format=Jpg&quality=90&api_key=%s", album_id, key);
-        ag = http_download(host, port, ap, ART, &ast);
-        have_art = (ag > 0 && ast == 200);
-        flog("art: HTTP %d, %ld bytes", ast, ag);
+        const char *src_id[2]; int t;
+        src_id[0] = album_id; src_id[1] = g_tr[0].id;      /* album cover, else track 1's embedded art */
+        for (t = 0; t < 2 && !have_art; t++) {
+            _snprintf(ap, sizeof ap, "/Items/%s/Images/Primary?maxWidth=300&maxHeight=300&format=Jpg&quality=90&api_key=%s", src_id[t], key);
+            ag = http_download(host, port, ap, ART, &ast);
+            have_art = (ag > 0 && ast == 200);
+            flog("art: %s: HTTP %d, %ld bytes", t ? "track 1" : "album", ast, ag);
+        }
         if (!have_art) DeleteFileW(ART);
     }
     {
@@ -478,11 +501,12 @@ static void album_mode(const char *host, int port, const char *key, const char *
     flush_out();
 
     /* 6. download the rest in order, well ahead of playback (~5x real time) */
-    for (k = 1; k < n; k++) {
+    for (k = 1; k < n && !stopping(); k++) {
         DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[k]);
         flog("dl %d/%d: %ld bytes in %lu ms", k + 1, n, got, GetTickCount() - t0);
         if (got <= 0) say("download of track %d failed\r\n", k + 1);
     }
+    if (stopping()) { flog("stopped by a newer jfplay"); say("stopped: a newer jfplay took over\r\n"); return; }
     say("all %d tracks downloaded\r\n", n);
 }
 
@@ -625,7 +649,14 @@ done:
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show) {
     static char outbuf[8192]; char args[512]; int used = 0; WSADATA wsa;
     HANDLE h; DWORD w;
+    HANDLE mtx;
     (void)hi; (void)hp; (void)show;
+    /* one jfplay at a time: ask a running one to stop, then wait for it */
+    g_stop = CreateEventW(NULL, TRUE, FALSE, L"ZuneFinStop");
+    mtx = CreateMutexW(NULL, FALSE, L"ZuneFinPlayer");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) SetEvent(g_stop);
+    if (mtx && WaitForSingleObject(mtx, 15000) == WAIT_TIMEOUT) return 2;
+    ResetEvent(g_stop);
     DeleteFileW(L"\\flash2\\zunefin.log");
     flog("exe started");
     WideCharToMultiByte(CP_UTF8, 0, cmdline, -1, args, sizeof args, NULL, NULL);
@@ -635,6 +666,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show) {
     h = CreateFileW(L"\\flash2\\zunefin-out.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { WriteFile(h, outbuf, used, &w, NULL); CloseHandle(h); }
     flog("exe finished");
+    if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
     return 0;
 }
 #else

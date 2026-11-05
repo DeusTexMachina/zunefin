@@ -32,7 +32,7 @@ PY
   push)
     shift
     for f in "$@"; do
-      python3 "$LYRA/tools/general/lyra-write-file.py" "$ZUNE" "$f" "\\flash2\\automation\\$(basename "$f")" --quiet
+      python3 "$LYRA/tools/general/lyra-write-file.py" "$ZUNE" "$f" "\\flash2\\automation\\$(basename "$f")" --quiet --timeout 30
       echo "pushed $(basename "$f")"
     done
     ;;
