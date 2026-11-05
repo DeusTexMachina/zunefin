@@ -15,7 +15,7 @@ Early prototype, driven from a Mac's Terminal.
 - [x] Play a song through the native player
 - [x] Title, artist, album, length and cover on Now Playing
 - [x] Play a whole album as a native queue (next/previous/auto-advance), downloading ahead
-- [ ] Start playback before the whole song has downloaded
+- [x] Stream songs (starts in seconds, skip anywhere) via a jf:// source filter
 - [x] Browse artists, albums and songs from the Zune's browser (http://127.0.0.1:8090)
 - [x] Starts at boot as a Lyra mod
 - [ ] A native Jellyfin tile on the Start menu
