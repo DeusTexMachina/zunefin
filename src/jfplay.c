@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <tlhelp32.h>
 
 #define EXPORT __declspec(dllexport)
 
@@ -51,6 +52,15 @@ static void flog(const char *fmt, ...) {
 }
 
 static char *o_buf; static int o_max, o_used;
+
+/* Write what we have so far to \flash2\zunefin-out.txt (album mode runs for minutes). */
+static void flush_out(void) {
+    HANDLE h = CreateFileW(L"\\flash2\\zunefin-out.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD w;
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, o_buf, o_used, &w, NULL);
+    CloseHandle(h);
+}
 static void say(const char *fmt, ...) {
     va_list ap; int n;
     if (o_used >= o_max - 1) return;
@@ -63,7 +73,7 @@ static void say(const char *fmt, ...) {
 
 /* HTTP/1.0 GET; returns malloc'd body (NUL-terminated) or NULL. */
 static char *http_get(const char *host, int port, const char *path, int *status) {
-    SOCKET s; struct sockaddr_in a; char req[700]; int n, cap = 65536, len = 0;
+    SOCKET s; struct sockaddr_in a; char req[700]; int n, cap = 524288, len = 0;
     char *buf, *body;
     *status = 0;
     s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -236,6 +246,246 @@ static void clean_cache(void) {
     FindClose(h);
 }
 
+
+/* ===================== album mode: native queue ===================== */
+
+typedef int (*CreateSongFn)(DWORD kind, DWORD *out_id);
+typedef int (*MoveToFn)(int pos);
+#define CREATE_SONG ((CreateSongFn)0x4198484c)   /* create(kind, &id): kind 0xfd runtime song */
+
+/* servicesd's runtime (URL-song) now-playing queue, firmware 4.5 (from Lyra yt_queue.c):
+   id storage std::vector<u32> at +0x60/64/68, play-order at +0x6c/70/74, cursor +0xa4. */
+#define QOBJ          0x41a525d4u
+#define OFF_ID_BEGIN  0x60
+#define OFF_ID_END    0x64
+#define OFF_ID_CAP    0x68
+#define OFF_ORD_BEGIN 0x6c
+#define OFF_ORD_END   0x70
+#define OFF_ORD_CAP   0x74
+#define OFF_CUR       0xa4
+
+static DWORD find_servicesd(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32 pe; DWORD pid = 0;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    pe.dwSize = sizeof pe;
+    if (Process32First(snap, &pe)) {
+        do { if (wcsstr(pe.szExeFile, L"servicesd")) { pid = pe.th32ProcessID; break; } }
+        while (Process32Next(snap, &pe));
+    }
+    CloseToolhelp32Snapshot(snap);
+    return pid;
+}
+
+static HANDLE q_open(void) {
+    DWORD pid = find_servicesd(); HANDLE h;
+    if (!pid) { flog("queue: servicesd not found"); return NULL; }
+    h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!h) flog("queue: OpenProcess(servicesd) failed err %lu", GetLastError());
+    return h;
+}
+static int rmem(HANDLE h, DWORD va, void *b, DWORD n) { DWORD g = 0; return (ReadProcessMemory(h, (LPCVOID)va, b, n, &g) && g == n) ? 0 : -1; }
+static int wmem(HANDLE h, DWORD va, const void *b, DWORD n) { DWORD g = 0; return (WriteProcessMemory(h, (LPVOID)va, (LPCVOID)b, n, &g) && g == n) ? 0 : -1; }
+
+static int q_count(HANDLE h) {
+    DWORD b, e;
+    if (rmem(h, QOBJ + OFF_ORD_BEGIN, &b, 4) || rmem(h, QOBJ + OFF_ORD_END, &e, 4)) { flog("queue: read failed err %lu", GetLastError()); return -1; }
+    return e >= b ? (int)((e - b) / 4) : -1;
+}
+static int q_push_id(HANDLE h, DWORD id) {
+    DWORD b, e, c, v;
+    if (rmem(h, QOBJ + OFF_ID_BEGIN, &b, 4) || rmem(h, QOBJ + OFF_ID_END, &e, 4) || rmem(h, QOBJ + OFF_ID_CAP, &c, 4)) return -1;
+    if (!b || e < b || e + 4 > c) { flog("queue: id storage full (cap %lu)", (unsigned long)((c - b) / 4)); return -1; }
+    if (wmem(h, e, &id, 4)) return -1;
+    v = e + 4;
+    if (wmem(h, QOBJ + OFF_ID_END, &v, 4)) return -1;
+    return (int)((e - b) / 4);
+}
+static int q_set_order(HANDLE h, const DWORD *order, int n, int cur) {
+    DWORD b, c, v; int i;
+    if (rmem(h, QOBJ + OFF_ORD_BEGIN, &b, 4) || rmem(h, QOBJ + OFF_ORD_CAP, &c, 4)) return -1;
+    if (!b || b + (DWORD)n * 4 > c) { flog("queue: order capacity too small for %d", n); return -1; }
+    for (i = 0; i < n; i++) if (wmem(h, b + (DWORD)i * 4, &order[i], 4)) return -1;
+    v = b + (DWORD)n * 4;  if (wmem(h, QOBJ + OFF_ORD_END, &v, 4)) return -1;
+    v = (DWORD)cur;        if (wmem(h, QOBJ + OFF_CUR, &v, 4)) return -1;
+    return 0;
+}
+
+typedef struct { char id[40]; char name[160]; char artist[160]; int dur_ms; DWORD song; } Track;
+#define MAX_TRACKS 60
+static Track g_tr[MAX_TRACKS];
+
+/* Split the Items array into top-level objects and pull each track's fields. */
+static int parse_tracks(const char *body) {
+    const char *p = strstr(body, "\"Items\":["), *s; int n = 0;
+    if (!p) return 0;
+    p += 9;
+    while (*p && n < MAX_TRACKS) {
+        int depth = 0, instr = 0, len; char *obj;
+        while (*p && *p != '{' && *p != ']') p++;
+        if (*p != '{') break;
+        s = p;
+        for (; *p; p++) {
+            if (instr) { if (*p == '\\' && p[1]) p++; else if (*p == '"') instr = 0; continue; }
+            if (*p == '"') instr = 1;
+            else if (*p == '{') depth++;
+            else if (*p == '}' && --depth == 0) { p++; break; }
+        }
+        len = (int)(p - s);
+        obj = (char *)malloc(len + 1);
+        if (!obj) break;
+        memcpy(obj, s, len); obj[len] = 0;
+        if (json_str(obj, "Id", g_tr[n].id, sizeof g_tr[n].id)) {
+            const char *ar = strstr(obj, "\"Artists\":[\"");
+            json_str(obj, "Name", g_tr[n].name, sizeof g_tr[n].name);
+            g_tr[n].dur_ms = json_ticks_ms(obj);
+            g_tr[n].artist[0] = 0;
+            if (ar) json_decode(ar + 12, g_tr[n].artist, sizeof g_tr[n].artist);
+            if (!g_tr[n].artist[0]) json_str(obj, "AlbumArtist", g_tr[n].artist, sizeof g_tr[n].artist);
+            g_tr[n].song = 0;
+            n++;
+        }
+        free(obj);
+    }
+    return n;
+}
+
+static void track_path(const Track *t, wchar_t *out) {
+    wchar_t wid[48];
+    MultiByteToWideChar(CP_UTF8, 0, t->id, -1, wid, 48);
+    swprintf(out, L"\\flash2\\zunefin\\%s.mp3", wid);
+}
+
+static long download_track(const char *host, int port, const char *key, const Track *t) {
+    char p[400]; wchar_t dest[MAX_PATH]; int st; long got;
+    _snprintf(p, sizeof p, "/Audio/%s/stream.mp3?audioCodec=mp3&audioBitRate=192000"
+              "&audioChannels=2&audioSampleRate=44100&api_key=%s", t->id, key);
+    track_path(t, dest);
+    got = http_download(host, port, p, dest, &st);
+    if (st != 200) got = -1;
+    return got;
+}
+
+static void attach_art(DWORD song, const wchar_t *art) {
+    wchar_t dir[80], file[100];
+    art_path(song, dir, file);
+    if (CopyFileW(art, file, FALSE)) ZDK_SETINT((void *)song, 0x10008, 1);
+}
+
+static void album_mode(const char *host, int port, const char *key, const char *album_in) {
+    char path[600], album_id[64] = "", album[160] = "", album_artist[160] = "";
+    char *body; int status, n, k, have_art = 0, queued = 0;
+    HMODULE zdk; PlaySongFromUrlFn play; HANDLE q = NULL;
+    static wchar_t wt[200], wp[MAX_PATH], wa[160], wb[160];
+    DWORD order[MAX_TRACKS]; int m = 0;
+    const wchar_t *ART = L"\\flash2\\zunefin\\art.jpg";
+
+    /* 1. which album */
+    if (album_in && album_in[0])
+        _snprintf(path, sizeof path, "/Items?Ids=%s&api_key=%s", album_in, key);
+    else
+        _snprintf(path, sizeof path, "/Items?IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=Random&Limit=1&EnableImages=false&EnableUserData=false&api_key=%s", key);
+    body = http_get(host, port, path, &status);
+    if (!body || status != 200) { say("album lookup failed (HTTP %d)\r\n", status); free(body); return; }
+    {
+        const char *it = strstr(body, "\"Items\":[");
+        if (it) { json_str(it, "Id", album_id, sizeof album_id); json_str(it, "Name", album, sizeof album);
+                  json_str(it, "AlbumArtist", album_artist, sizeof album_artist); }
+    }
+    free(body);
+    if (!album_id[0]) { say("no album found\r\n"); return; }
+    flog("album: %s [%s] by %s", album, album_id, album_artist);
+
+    /* 2. its tracks, in disc/track order */
+    _snprintf(path, sizeof path, "/Items?ParentId=%s&IncludeItemTypes=Audio&Recursive=true"
+              "&SortBy=ParentIndexNumber,IndexNumber,SortName&EnableImages=false&EnableUserData=false"
+              "&Limit=%d&api_key=%s", album_id, MAX_TRACKS, key);
+    body = http_get(host, port, path, &status);
+    if (!body || status != 200) { say("track list failed (HTTP %d)\r\n", status); free(body); return; }
+    n = parse_tracks(body);
+    free(body);
+    flog("album: %d tracks", n);
+    say("album: %s - %s (%d tracks)\r\n", album_artist, album, n);
+    if (n == 0) return;
+    for (k = 0; k < n; k++) say("  %2d. %s (%d:%02d)\r\n", k + 1, g_tr[k].name, g_tr[k].dur_ms / 60000, (g_tr[k].dur_ms / 1000) % 60);
+
+    clean_cache();
+
+    /* 3. cover (album-level), then the first track */
+    {
+        char ap[300]; int ast; long ag;
+        _snprintf(ap, sizeof ap, "/Items/%s/Images/Primary?maxWidth=300&maxHeight=300&format=Jpg&quality=90&api_key=%s", album_id, key);
+        ag = http_download(host, port, ap, ART, &ast);
+        have_art = (ag > 0 && ast == 200);
+        flog("art: HTTP %d, %ld bytes", ast, ag);
+        if (!have_art) DeleteFileW(ART);
+    }
+    {
+        DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[0]);
+        flog("dl 1/%d: %ld bytes in %lu ms", n, got, GetTickCount() - t0);
+        if (got <= 0) { say("download of track 1 failed\r\n"); return; }
+    }
+
+    /* 4. play track 1 */
+    zdk = LoadLibraryW(L"zdksystem.dll");
+    play = zdk ? (PlaySongFromUrlFn)GetProcAddress(zdk, L"ZDKMedia_Queue_PlaySongFromURL") : NULL;
+    if (!play) { say("PlaySongFromURL missing\r\n"); return; }
+    MultiByteToWideChar(CP_UTF8, 0, g_tr[0].name, -1, wt, 200);
+    track_path(&g_tr[0], wp);
+    status = play(wt, wp);
+    flog("play: track 1 returned 0x%08x", status);
+    if (status < 0) { say("player refused track 1 (0x%08x)\r\n", status); return; }
+    Sleep(300);
+    set_meta(zdk, have_art ? ART : NULL, g_tr[0].dur_ms, g_tr[0].artist, album);
+    say("playing track 1\r\n");
+
+    /* 5. create + queue tracks 2..n now; their files download below */
+    MultiByteToWideChar(CP_UTF8, 0, album, -1, wb, 160);
+    if (n > 1 && (q = q_open()) != NULL) {
+        int tries, c = -1;
+        for (tries = 0; tries < 40; tries++) { c = q_count(q); if (c >= 1) break; Sleep(100); }
+        flog("queue: count %d after %d tries", c, tries);
+        if (c >= 1) {
+            order[m++] = 0;                          /* track 1 sits at storage 0 */
+            for (k = 1; k < n; k++) {
+                DWORD id = 0; int si;
+                if (CREATE_SONG(0xfd, &id) < 0 || !id) { flog("queue: create failed at %d", k + 1); break; }
+                MultiByteToWideChar(CP_UTF8, 0, g_tr[k].name, -1, wt, 200);
+                MultiByteToWideChar(CP_UTF8, 0, g_tr[k].artist, -1, wa, 160);
+                track_path(&g_tr[k], wp);
+                ZDK_SETPROP((void *)id, 0x20001, (DWORD)wt);
+                ZDK_SETPROP((void *)id, 0x2000a, (DWORD)wp);
+                if (wa[0]) ZDK_SETPROP((void *)id, 0x20002, (DWORD)wa);
+                if (wb[0]) ZDK_SETPROP((void *)id, 0x20003, (DWORD)wb);
+                if (g_tr[k].dur_ms > 0) ZDK_SETINT((void *)id, 0x10003, (DWORD)g_tr[k].dur_ms);
+                si = q_push_id(q, id);
+                if (si < 0) { flog("queue: push failed at %d", k + 1); break; }
+                order[m++] = (DWORD)si;
+                g_tr[k].song = id;
+            }
+            if (m > 1 && q_set_order(q, order, m, 0) == 0) {
+                MoveToFn mv = (MoveToFn)GetProcAddress(zdk, L"ZDKMedia_Queue_MoveTo");
+                queued = m;
+                flog("queue: %d songs queued", m);
+                if (mv) mv(0);   /* sync the live cursor (proven YouTube-mod sequence) */
+            }
+            if (have_art) for (k = 1; k < m; k++) if (g_tr[k].song) attach_art(g_tr[k].song, ART);
+        }
+        CloseHandle(q);
+    }
+    if (queued) say("queued %d songs: use next/previous on the Zune\r\n", queued);
+    else        say("couldn't add to the Zune's queue (see log); only track 1 will play\r\n");
+    flush_out();
+
+    /* 6. download the rest in order, well ahead of playback (~5x real time) */
+    for (k = 1; k < n; k++) {
+        DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[k]);
+        flog("dl %d/%d: %ld bytes in %lu ms", k + 1, n, got, GetTickCount() - t0);
+        if (got <= 0) say("download of track %d failed\r\n", k + 1);
+    }
+    say("all %d tracks downloaded\r\n", n);
+}
+
 static int run(const void *arg, int arg_len, void *out, int out_max, int *out_used) {
     char a[512], host[64] = "", key[80] = "", mode[16] = "fileurl", item[64] = "";
     char name[160] = "Jellyfin", artist[160] = "", album[160] = "", album_id[64] = "", path[600];
@@ -251,7 +501,8 @@ static int run(const void *arg, int arg_len, void *out, int out_max, int *out_us
     flog("=== jfplay start ===");
     sscanf(a, "%63s %d %79s %15s %63s", host, &port, key, mode, item);
     flog("args: host=%s port=%d mode=%s item=%s", host, port, mode, item);
-    if (!host[0] || !key[0]) { say("usage: --arg \"<ip> <port> <api_key> [file|mp3|static|aac|url] [item_id]\"\r\n"); goto done; }
+    if (!host[0] || !key[0]) { say("usage: --arg \"<ip> <port> <api_key> [fileurl|album|file|mp3|static|aac|url] [item_id]\"\r\n"); goto done; }
+    if (!strcmp(mode, "album")) { album_mode(host, port, key, item); goto done; }
 
     /* 1. pick a song */
     if (item[0]) {

@@ -11,6 +11,7 @@
 #   zf ping                 check Lyra answers on the Zune
 #   zf push FILE...         copy files to \flash2\automation on the Zune
 #   zf play [ITEM_ID]       play a random song (or ITEM_ID) with jfplay.exe
+#   zf album [ALBUM_ID]     play a random album (or ALBUM_ID) as a queue
 #   zf log                  show jfplay's log and result
 set -e
 LYRA=${LYRA:-$HOME/project-lyra}
@@ -35,6 +36,11 @@ PY
     python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
       --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY fileurl $2"
     ;;
+  album)
+    need_jf
+    python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
+      --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY album $2"
+    ;;
   log)
     T=$(mktemp -d)
     python3 "$LYRA/tools/general/lyra-read-file.py" "$ZUNE" '\flash2\zunefin.log' '\flash2\zunefin-out.txt' \
@@ -42,5 +48,5 @@ PY
     cat "$T"/* 2>/dev/null || echo "no log yet"
     rm -rf "$T"
     ;;
-  *) sed -n '2,16p' "$0" ;;
+  *) sed -n '2,17p' "$0" ;;
 esac
