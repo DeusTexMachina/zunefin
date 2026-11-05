@@ -1,0 +1,100 @@
+#!/bin/sh
+# zf: ZuneFin helper for your Mac. Wraps the Project Lyra Python tools.
+#
+# Set these once per Terminal window (or put them in ~/.zshrc):
+#   export ZUNE=192.168.1.208          # Zune HD IP
+#   export JF="192.168.1.156 8096"     # Jellyfin IP and port
+#   export JFKEY=...                   # Jellyfin API key
+#   export LYRA=~/project-lyra         # clone of project-lyra (default)
+#
+# usage:
+#   zf ping                 check Lyra answers on the Zune
+#   zf push FILE...         copy files to \flash2\automation on the Zune
+#   zf play [ITEM_ID]       play a random song (or ITEM_ID) with jfplay.exe
+#   zf album [ALBUM_ID]     play a random album (or ALBUM_ID) as a queue
+#   zf log                  show jfplay's log and result
+#   zf serve                start the browse server (open http://127.0.0.1:8090 on the Zune)
+#   zf stop                 stop the browse server (needed before pushing a new jfplay.exe)
+#   zf install              install ZuneFin as a Lyra mod so the server starts at boot
+#   zf slog                 show the streaming plug-in's log
+set -e
+LYRA=${LYRA:-$HOME/project-lyra}
+die() { echo "zf: $*" >&2; exit 1; }
+[ -n "$ZUNE" ] || die "set ZUNE to the Zune IP address (export ZUNE=...)"
+need_jf() {
+  [ -n "$JF" ] || die "set JF to the Jellyfin IP and port (export JF=...)"
+  [ -n "$JFKEY" ] || die "set JFKEY to your Jellyfin API key (export JFKEY=...)"
+}
+[ -d "$LYRA/tools" ] || die "no Project Lyra tools at $LYRA (export LYRA=/path/to/project-lyra)"
+HERE=$(cd "$(dirname "$0")" && pwd)
+stop_server() {
+  if curl -s -m 3 "http://$ZUNE:8090/quit" >/dev/null 2>&1; then echo "stopped the ZuneFin server"; sleep 2; fi
+}
+case "$1" in
+  serve)
+    need_jf
+    python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
+      --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY serve"
+    sleep 3
+    if curl -s -m 5 "http://$ZUNE:8090/status" >/dev/null 2>&1; then
+      echo "ZuneFin server is up. On the Zune, open the browser and go to http://127.0.0.1:8090"
+      echo "(or try it from this Mac: http://$ZUNE:8090)"
+    else
+      echo "server did not answer yet; try: zf log"
+    fi
+    ;;
+  stop)
+    stop_server
+    ;;
+  install)
+    [ -f "$HERE/mod/manifest.json" ] || die "mod/manifest.json missing next to zf"
+    [ -f "$HERE/jfplay.exe" ] || die "jfplay.exe missing next to zf"
+    [ -f "$HERE/zfstream.dll" ] || die "zfstream.dll missing next to zf"
+    stop_server
+    T=$(mktemp -d)/zunefin
+    mkdir -p "$T" && cp "$HERE/mod/manifest.json" "$HERE/jfplay.exe" "$HERE/zfstream.dll" "$T/"
+    python3 "$LYRA/modkit/mod-apply.py" apply "$T" --ip "$ZUNE"
+    rm -rf "$(dirname "$T")"
+    echo
+    echo "Next: restart the Zune, open Mods, turn ZuneFin on, then restart once more."
+    ;;
+  ping)
+    python3 - "$ZUNE" <<'PY'
+import socket, sys
+s = socket.create_connection((sys.argv[1], 1337), timeout=5); print(s.recv(6).decode().strip() or "no banner"); s.close()
+PY
+    ;;
+  push)
+    shift
+    stop_server
+    for f in "$@"; do
+      python3 "$LYRA/tools/general/lyra-write-file.py" "$ZUNE" "$f" "\\flash2\\automation\\$(basename "$f")" --quiet --timeout 30
+      echo "pushed $(basename "$f")"
+    done
+    ;;
+  play)
+    need_jf
+    python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
+      --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY fileurl $2"
+    ;;
+  album)
+    need_jf
+    python3 "$LYRA/tools/re/lyra-plugin-call.py" "$ZUNE" '\flash2\automation\jflaunch.dll' \
+      --entry Run --arg "\\flash2\\automation\\jfplay.exe|$JF $JFKEY album $2"
+    ;;
+  slog)
+    T=$(mktemp -d)
+    python3 "$LYRA/tools/general/lyra-read-file.py" "$ZUNE" '\flash2\zunefin-stream.log' \
+      --output-dir "$T" --timeout 15 >/dev/null 2>&1 || true
+    cat "$T"/* 2>/dev/null || echo "no streaming log yet (the plug-in has not been loaded)"
+    rm -rf "$T"
+    ;;
+  log)
+    T=$(mktemp -d)
+    python3 "$LYRA/tools/general/lyra-read-file.py" "$ZUNE" '\flash2\zunefin.log' '\flash2\zunefin-out.txt' \
+      --output-dir "$T" --timeout 15 >/dev/null 2>&1 || true
+    cat "$T"/* 2>/dev/null || echo "no log yet"
+    rm -rf "$T"
+    ;;
+  *) sed -n '2,21p' "$0" ;;
+esac
