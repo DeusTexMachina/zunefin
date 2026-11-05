@@ -58,7 +58,9 @@ static const GUID FMT_WFX   = {0x05589f81,0xc356,0x11ce,{0xbf,0x01,0x00,0xaa,0x0
 /* {C0FFEE10-2026-4A6E-B0DE-5A554E454649} "ZUNEFI" */
 static const GUID CLSID_ZFStream = {0xC0FFEE10,0x2026,0x4A6E,{0xB0,0xDE,0x5A,0x55,0x4E,0x45,0x46,0x49}};
 
-static unsigned char g_wfx[18] = {0x0a,0x16, 2,0, 0x44,0xac,0,0, 0,0,0,0, 0,0, 0,0, 0,0};
+/* WAVEFORMATEX template: tag 0x160a, 2 ch, 44100 Hz, cbSize 0. Each filter patches its own copy
+   from the first ADTS header. */
+static const unsigned char g_wfx_default[18] = {0x0a,0x16, 2,0, 0x44,0xac,0,0, 0,0,0,0, 0,0, 0,0, 0,0};
 
 #define VT(o) (*(void ***)(o))
 static int geq(const GUID *a, const GUID *b) { return memcmp(a, b, 16) == 0; }
@@ -67,20 +69,20 @@ static LONG g_objs;
 typedef void *(*CoTaskMemAllocFn)(unsigned long);
 static CoTaskMemAllocFn g_ctma;
 
-static void fill_mt(AMMT *m) {
+static void fill_mt(AMMT *m, unsigned char *wfx) {
     memset(m, 0, sizeof *m);
     m->majortype = MT_Audio; m->subtype = MT_AAC; m->lSampleSize = 1;
-    m->formattype = FMT_WFX; m->cbFormat = 18; m->pbFormat = g_wfx;
+    m->formattype = FMT_WFX; m->cbFormat = 18; m->pbFormat = wfx;
 }
-static AMMT *mt_alloc(void) {
+static AMMT *mt_alloc(const unsigned char *wfx) {
     AMMT *m; unsigned char *pb;
     if (!g_ctma) { HMODULE ole = LoadLibraryW(L"ole32.dll"); if (ole) g_ctma = (CoTaskMemAllocFn)GetProcAddressW(ole, L"CoTaskMemAlloc"); }
     if (!g_ctma) return NULL;
     m = (AMMT *)g_ctma(sizeof(AMMT));
     if (!m) return NULL;
-    fill_mt(m);
+    fill_mt(m, NULL);
     pb = (unsigned char *)g_ctma(18);
-    if (pb) { memcpy(pb, g_wfx, 18); m->pbFormat = pb; }
+    if (pb) { memcpy(pb, wfx, 18); m->pbFormat = pb; }
     return m;
 }
 
@@ -96,10 +98,11 @@ struct Filter {
     LONG ref; Pin *pin; void *graph; int state;
     SOCKET sock;
     unsigned char *ring; volatile LONG wr, rd; volatile LONG done, err;
+    unsigned char wfx[18];
     HANDLE hStop, hFetch, hPush;
     wchar_t cur[260];
 };
-typedef struct { void *v; LONG ref; int idx; } EnumMT;
+typedef struct { void *v; LONG ref; int idx; const unsigned char *wfx; } EnumMT;
 typedef struct { void *v; LONG ref; Filter *f; int idx; } EnumPins;
 typedef struct { void *v; LONG ref; } Factory;
 
@@ -111,7 +114,7 @@ static Filter *from_fsf(void *o) { return (Filter *)((char *)o - sizeof(void *))
 static HRESULT EM_QI(void *o, const GUID *i, void **out) { EnumMT *e = o; if (geq(i, &IID_IUnknown_) || geq(i, &IID_IEnumMediaTypes_)) { *out = o; InterlockedIncrement(&e->ref); return 0; } *out = 0; return 0x80004002; }
 static ULONG EM_AR(void *o) { return InterlockedIncrement(&((EnumMT *)o)->ref); }
 static ULONG EM_RL(void *o) { EnumMT *e = o; LONG r = InterlockedDecrement(&e->ref); if (!r) LocalFree(e); return r; }
-static HRESULT EM_Next(void *o, ULONG c, AMMT **out, ULONG *got) { EnumMT *e = o; ULONG n = 0; while (n < c && e->idx < 1) { AMMT *m = mt_alloc(); if (!m) break; out[n++] = m; e->idx++; } if (got) *got = n; return n == c ? 0 : 1; }
+static HRESULT EM_Next(void *o, ULONG c, AMMT **out, ULONG *got) { EnumMT *e = o; ULONG n = 0; while (n < c && e->idx < 1) { AMMT *m = mt_alloc(e->wfx); if (!m) break; out[n++] = m; e->idx++; } if (got) *got = n; return n == c ? 0 : 1; }
 static HRESULT EM_Skip(void *o, ULONG c) { ((EnumMT *)o)->idx += c; return 0; }
 static HRESULT EM_Reset(void *o) { ((EnumMT *)o)->idx = 0; return 0; }
 static HRESULT EM_Clone(void *o, void **p) { (void)o; *p = 0; return 0x80004001; }
@@ -157,7 +160,7 @@ static HRESULT P_QueryPinInfo(void *o, PININFO *info) { Pin *p = o; info->pFilte
 static HRESULT P_QueryDirection(void *o, int *d) { (void)o; *d = 1; return 0; }
 static HRESULT P_QueryId(void *o, wchar_t **id) { (void)o; *id = 0; return 0x80004001; }
 static HRESULT P_QueryAccept(void *o, const AMMT *m) { (void)o; return geq(&m->majortype, &MT_Audio) ? 0 : 1; }
-static HRESULT P_EnumMediaTypes(void *o, void **e) { EnumMT *em = (EnumMT *)LocalAlloc(LPTR, sizeof(EnumMT)); (void)o; if (!em) return 0x8007000e; em->v = g_EMV; em->ref = 1; *e = em; return 0; }
+static HRESULT P_EnumMediaTypes(void *o, void **e) { EnumMT *em = (EnumMT *)LocalAlloc(LPTR, sizeof(EnumMT)); if (!em) return 0x8007000e; em->v = g_EMV; em->ref = 1; em->wfx = ((Pin *)o)->f->wfx; *e = em; return 0; }
 static HRESULT P_QueryInternalConnections(void *o, void **a, ULONG *n) { (void)o; (void)a; if (n) *n = 0; return 0; }
 static HRESULT P_EndOfStream(void *o) { (void)o; return 0; }
 static HRESULT P_BeginFlush(void *o) { (void)o; return 0; }
@@ -175,6 +178,33 @@ static int read_config(char *host, int *port, char *key) {
     return sscanf(buf, "%63s %d %79s", host, port, key) == 3;
 }
 
+
+/* Read the first ADTS header (fetching a little more if needed) and set this
+   filter's WAVEFORMATEX to the stream's real sample rate and channel count. */
+static int read_format(Filter *f) {
+    static const int rates[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+    int i, n, sfi, ch, prof, rate;
+    while (f->wr < 4096) {                       /* the ring starts at 0 here */
+        n = recv(f->sock, (char *)f->ring + f->wr, 4096 - f->wr, 0);
+        if (n <= 0) break;
+        f->wr += n;
+    }
+    for (i = 0; i + 7 <= f->wr; i++)
+        if (f->ring[i] == 0xFF && (f->ring[i + 1] & 0xF6) == 0xF0) break;
+    if (i + 7 > f->wr) { slog("load: no ADTS header in the first %ld bytes", (long)f->wr); return 0; }
+    prof = (f->ring[i + 2] >> 6) + 1;
+    sfi  = (f->ring[i + 2] >> 2) & 0x0F;
+    ch   = ((f->ring[i + 2] & 1) << 2) | (f->ring[i + 3] >> 6);
+    if (sfi > 12) { slog("load: bad sample-rate index %d", sfi); return 0; }
+    rate = rates[sfi];
+    if (ch < 1 || ch > 2) ch = 2;
+    f->wfx[2] = (unsigned char)ch; f->wfx[3] = 0;
+    f->wfx[4] = (unsigned char)(rate & 0xFF); f->wfx[5] = (unsigned char)((rate >> 8) & 0xFF);
+    f->wfx[6] = (unsigned char)((rate >> 16) & 0xFF); f->wfx[7] = 0;
+    slog("load: AAC profile %d, %d Hz, %d ch", prof, rate, ch);
+    return 1;
+}
+
 /* Connect, send the request, read past the headers. Leftover body bytes go into the ring. */
 static int open_stream(Filter *f, const char *item) {
     char host[64], key[80], req[600], hdr[2048], *e; int port, n, hl = 0, code;
@@ -187,7 +217,7 @@ static int open_stream(Filter *f, const char *item) {
     a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = inet_addr(host);
     if (connect(f->sock, (struct sockaddr *)&a, sizeof a)) { slog("load: connect %s:%d err %d", host, port, WSAGetLastError()); return 0; }
     n = _snprintf(req, sizeof req,
-        "GET /Audio/%s/stream.aac?audioCodec=aac&audioBitRate=192000&audioChannels=2&audioSampleRate=44100&api_key=%s HTTP/1.0\r\n"
+        "GET /Audio/%s/stream.aac?audioCodec=aac&audioBitRate=192000&audioChannels=2&audioSampleRate=44100&maxAudioSampleRate=44100&api_key=%s HTTP/1.0\r\n"
         "Host: %s:%d\r\nUser-Agent: ZuneFin-stream/0.1\r\n\r\n", item, key, host, port);
     send(f->sock, req, n, 0);
     while (hl < (int)sizeof hdr - 1 && (n = recv(f->sock, hdr + hl, sizeof hdr - 1 - hl, 0)) > 0) {
@@ -198,7 +228,7 @@ static int open_stream(Filter *f, const char *item) {
             if (code != 200) { slog("load: HTTP %d", code); return 0; }
             if (body > 0) { memcpy(f->ring, e + 4, body); f->wr = body; }
             slog("load: stream open, %d body bytes in hand", body);
-            return 1;
+            return read_format(f);
         }
     }
     slog("load: no HTTP header (got %d bytes)", hl);
@@ -358,7 +388,8 @@ static Filter *make_filter(void) {
     if (!f || !p || !ring) { if (f) LocalFree(f); if (p) LocalFree(p); if (ring) free(ring); return NULL; }
     f->vF = g_FV; f->vFSF = g_SV; f->ref = 1; f->pin = p; f->sock = INVALID_SOCKET; f->ring = ring;
     f->hStop = CreateEventW(NULL, TRUE, FALSE, NULL);
-    p->v = g_PV; p->ref = 1; p->f = f; fill_mt(&p->mt);
+    memcpy(f->wfx, g_wfx_default, 18);
+    p->v = g_PV; p->ref = 1; p->f = f; fill_mt(&p->mt, f->wfx);
     InterlockedIncrement(&g_objs);
     return f;
 }
