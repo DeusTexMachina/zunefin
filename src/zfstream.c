@@ -106,6 +106,8 @@ struct Filter {
     char item[48];
     LONGLONG dur, base;                          /* 100 ns units, same as Jellyfin ticks */
     volatile LONG frames, discont;
+    volatile LONG need_open;                     /* fetch thread must (re)open the stream at open_pos */
+    LONGLONG open_pos;
     CRITICAL_SECTION seek_cs;
     HANDLE hStop, hFetch, hPush;
     wchar_t cur[260];
@@ -141,7 +143,7 @@ static ULONG F_AR(void *o);
 static HRESULT P_QI(void *o, const GUID *i, void **out) {
     Pin *p = o;
     if (geq(i, &IID_IUnknown_) || geq(i, &IID_IPin_)) { *out = &p->v; InterlockedIncrement(&p->ref); return 0; }
-    if (geq(i, &IID_IMediaSeeking_)) { *out = &p->f->vMS; InterlockedIncrement(&p->f->ref); slog("seek: pin QI(IMediaSeeking)"); return 0; }
+    if (geq(i, &IID_IMediaSeeking_)) { *out = &p->f->vMS; InterlockedIncrement(&p->f->ref); return 0; }
     *out = 0; return 0x80004002;
 }
 static ULONG P_AR(void *o) { return InterlockedIncrement(&((Pin *)o)->ref); }
@@ -276,7 +278,19 @@ static int open_stream(Filter *f, const char *item, LONGLONG start) {
 }
 
 static DWORD WINAPI fetch_thread(LPVOID param) {
-    Filter *f = param; unsigned char tmp[4096]; long total = f->wr;
+    Filter *f = param; unsigned char tmp[4096]; long total;
+    if (f->need_open) {                          /* after a seek or stop: reopen at open_pos */
+        DWORD t0 = GetTickCount();
+        if (!open_stream(f, f->item, f->open_pos)) {
+            slog("fetch: reopen at %ld ms failed", (long)(f->open_pos / 10000));
+            InterlockedExchange((LONG *)&f->err, 1);
+            InterlockedExchange((LONG *)&f->done, 1);
+            return 0;
+        }
+        InterlockedExchange((LONG *)&f->need_open, 0);
+        slog("fetch: reopened at %ld ms in %lu ms", (long)(f->open_pos / 10000), GetTickCount() - t0);
+    }
+    total = f->wr;
     for (;;) {
         LONG space = RING - (f->wr - f->rd); int n, want, first, pos;
         if (WaitForSingleObject(f->hStop, 0) == WAIT_OBJECT_0) break;
@@ -345,12 +359,14 @@ static DWORD WINAPI push_thread(LPVOID param) {
         if (frames == 1 || frames % 2000 == 0) slog("push: %d frames", frames);
     }
     slog("push: end after %d frames (%d resync bytes)", frames, resync);
-    if (p->peer && WaitForSingleObject(f->hStop, 0) != WAIT_OBJECT_0)
+    if (p->peer && !f->err && WaitForSingleObject(f->hStop, 0) != WAIT_OBJECT_0)
         ((HRESULT (*)(void *))VT(p->peer)[14])(p->peer);                                          /* EndOfStream */
     return 0;
 }
 
 /* ---------- IFileSourceFilter ---------- */
+
+static void start_threads(Filter *f, int push);
 
 static HRESULT F_QI(void *o, const GUID *i, void **out);
 static HRESULT FSF_QI(void *o, const GUID *i, void **out) { return F_QI(&from_fsf(o)->vF, i, out); }
@@ -376,7 +392,8 @@ static HRESULT FSF_Load(void *o, const wchar_t *name, const AMMT *pmt) {
         if (f->sock != INVALID_SOCKET) { closesocket(f->sock); f->sock = INVALID_SOCKET; }
         return 0x80004005;
     }
-    f->hFetch = CreateThread(NULL, 0, fetch_thread, f, 0, NULL);
+    f->need_open = 0;
+    start_threads(f, 0);
     return f->hFetch ? 0 : 0x80004005;
 }
 static HRESULT FSF_GetCurFile(void *o, wchar_t **pp, AMMT *pmt) { (void)pmt; if (pp) *pp = from_fsf(o)->cur; return 0; }
@@ -387,7 +404,7 @@ static HRESULT F_QI(void *o, const GUID *i, void **out) {
     Filter *f = o;
     if (geq(i, &IID_IUnknown_) || geq(i, &IID_IPersist_) || geq(i, &IID_IMediaFilter_) || geq(i, &IID_IBaseFilter_)) { *out = &f->vF; InterlockedIncrement(&f->ref); return 0; }
     if (geq(i, &IID_IFileSourceFilter_)) { *out = &f->vFSF; InterlockedIncrement(&f->ref); return 0; }
-    if (geq(i, &IID_IMediaSeeking_)) { *out = &f->vMS; InterlockedIncrement(&f->ref); slog("seek: filter QI(IMediaSeeking)"); return 0; }
+    if (geq(i, &IID_IMediaSeeking_)) { *out = &f->vMS; InterlockedIncrement(&f->ref); return 0; }
     *out = 0; return 0x80004002;
 }
 static ULONG F_AR(void *o) { return InterlockedIncrement(&((Filter *)o)->ref); }
@@ -410,11 +427,33 @@ static ULONG F_RL(void *o) {
     }
     return r;
 }
+
+/* Fresh ring + threads. The fetch thread opens the stream itself when need_open is set. */
+static void start_threads(Filter *f, int push) {
+    ResetEvent(f->hStop);
+    if (!f->hFetch) {
+        if (f->need_open) { f->wr = 0; f->rd = 0; }
+        f->done = 0; f->err = 0;
+        f->hFetch = CreateThread(NULL, 0, fetch_thread, f, 0, NULL);
+    }
+    if (push && !f->hPush && f->pin->mem && f->pin->alloc)
+        f->hPush = CreateThread(NULL, 0, push_thread, f, 0, NULL);
+}
 static HRESULT F_GetClassID(void *o, GUID *id) { (void)o; *id = CLSID_ZFStream; return 0; }
-static HRESULT F_Stop(void *o) { Filter *f = o; f->state = 0; slog("filter: stop"); stop_threads(f); return 0; }
+static LONGLONG cur_pos(Filter *f);
+static HRESULT F_Stop(void *o) {
+    Filter *f = o; LONGLONG pos;
+    f->state = 0;
+    stop_threads(f);
+    pos = cur_pos(f);
+    if (!f->need_open) { f->open_pos = pos; f->base = pos; f->frames = 0; f->discont = 1; f->need_open = 1; }
+    slog("filter: stop at %ld ms", (long)(pos / 10000));
+    return 0;
+}
 static HRESULT F_Pause(void *o) {
-    Filter *f = o; f->state = 1;
-    if (!f->hPush && f->pin->mem && f->pin->alloc) { f->hPush = CreateThread(NULL, 0, push_thread, f, 0, NULL); slog("filter: pause, push thread started"); }
+    Filter *f = o; int was = f->state;
+    f->state = 1;
+    if (was == 0) { start_threads(f, 1); slog("filter: pause from stop (%s)", f->need_open ? "reopening" : "stream ready"); }
     return 0;
 }
 static HRESULT F_Run(void *o, LONGLONG t) { (void)t; ((Filter *)o)->state = 2; return 0; }
@@ -441,28 +480,22 @@ static LONGLONG cur_pos(Filter *f) {
     return (f->dur && p > f->dur) ? f->dur : p;
 }
 
-/* Jump to `pos`: flush downstream, stop the threads, reopen the stream there, restart. */
+/* Jump to `pos` without blocking: flush downstream, stop the threads, and let the
+   fetch thread reopen Jellyfin's stream there. A seek to where a fresh stream already
+   starts is ignored (zmedia sends SetPositions(0) twice right after Load). */
 static HRESULT do_seek(Filter *f, LONGLONG pos) {
-    Pin *p = f->pin; int was_running;
+    Pin *p = f->pin; int active;
     if (pos < 0) pos = 0;
     if (f->dur && pos > f->dur - 10000000) pos = f->dur > 10000000 ? f->dur - 10000000 : 0;   /* keep 1 s */
     EnterCriticalSection(&f->seek_cs);
+    if (f->frames == 0 && pos == (f->need_open ? f->open_pos : f->base)) { LeaveCriticalSection(&f->seek_cs); return 0; }
     slog("seek: to %ld ms (state %d)", (long)(pos / 10000), f->state);
-    was_running = f->hPush != 0;
-    if (p->peer) ((HRESULT (*)(void *))VT(p->peer)[15])(p->peer);         /* BeginFlush: unblocks GetBuffer/Receive */
+    active = f->state != 0;
+    if (active && p->peer) ((HRESULT (*)(void *))VT(p->peer)[15])(p->peer);   /* BeginFlush: unblocks GetBuffer/Receive */
     stop_threads(f);
-    if (p->peer) ((HRESULT (*)(void *))VT(p->peer)[16])(p->peer);         /* EndFlush */
-    ResetEvent(f->hStop);
-    f->wr = 0; f->rd = 0; f->done = 0;
-    f->base = pos; f->frames = 0; f->discont = 1;
-    if (!open_stream(f, f->item, pos)) {
-        slog("seek: reopen failed");
-        if (f->sock != INVALID_SOCKET) { closesocket(f->sock); f->sock = INVALID_SOCKET; }
-        LeaveCriticalSection(&f->seek_cs);
-        return 0x80004005;
-    }
-    f->hFetch = CreateThread(NULL, 0, fetch_thread, f, 0, NULL);
-    if (was_running || f->state != 0) f->hPush = CreateThread(NULL, 0, push_thread, f, 0, NULL);
+    if (active && p->peer) ((HRESULT (*)(void *))VT(p->peer)[16])(p->peer);   /* EndFlush */
+    f->base = pos; f->open_pos = pos; f->frames = 0; f->discont = 1; f->need_open = 1;
+    if (active) start_threads(f, 1);
     LeaveCriticalSection(&f->seek_cs);
     return 0;
 }
@@ -482,12 +515,13 @@ static HRESULT MS_GetStopPosition(void *o, LONGLONG *s) { *s = from_ms(o)->dur; 
 static HRESULT MS_GetCurrentPosition(void *o, LONGLONG *c) { *c = cur_pos(from_ms(o)); return 0; }
 static HRESULT MS_ConvertTimeFormat(void *o, LONGLONG *t, const GUID *tf, LONGLONG s, const GUID *sf) { (void)o; (void)tf; (void)sf; *t = s; return 0; }
 static HRESULT MS_SetPositions(void *o, LONGLONG *cur, DWORD cf, LONGLONG *stop, DWORD sf) {
-    Filter *f = from_ms(o); DWORD how = cf & 3; LONGLONG target;
+    Filter *f = from_ms(o); DWORD how = cf & 3; LONGLONG target; HRESULT hr;
     (void)stop; (void)sf;
-    slog("seek: SetPositions flags 0x%lx", (unsigned long)cf);
     if (how == 0 || !cur) return 0;                       /* no change to the current position */
     target = (how == 1) ? *cur : cur_pos(f) + *cur;       /* absolute, or relative/incremental */
-    return do_seek(f, target);
+    hr = do_seek(f, target);
+    if (cf & 8) *cur = f->need_open ? f->open_pos : f->base;   /* AM_SEEKING_ReturnTime */
+    return hr;
 }
 static HRESULT MS_GetPositions(void *o, LONGLONG *c, LONGLONG *s) { Filter *f = from_ms(o); if (c) *c = cur_pos(f); if (s) *s = f->dur; return 0; }
 static HRESULT MS_GetAvailable(void *o, LONGLONG *e, LONGLONG *l) { Filter *f = from_ms(o); if (e) *e = 0; if (l) *l = f->dur; return 0; }
