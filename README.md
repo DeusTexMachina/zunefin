@@ -16,14 +16,18 @@ Early prototype, driven from a Mac's Terminal.
 - [x] Title, artist, album, length and cover on Now Playing
 - [x] Play a whole album as a native queue (next/previous/auto-advance), downloading ahead
 - [ ] Start playback before the whole song has downloaded
-- [ ] A Jellyfin tile on the Start menu for browsing
+- [x] Browse artists, albums and songs from the Zune's browser (http://127.0.0.1:8090)
+- [x] Starts at boot as a Lyra mod
+- [ ] A native Jellyfin tile on the Start menu
 
 ## Layout
 
 ```
 src/jfping.c      network test plugin (GET /System/Info/Public)
 src/jflaunch.c    tiny Lyra plugin that starts a normal program
-src/jfplay.c      the player: pick a song, download, play, set metadata
+src/jfplay.c      the player: pick a song or album, download, queue, set metadata
+src/serve.inc.c   the browse server and its pages
+mod/manifest.json Lyra mod: starts jfplay.exe at boot, keeps Wi-Fi awake
 tools/build.sh    safe build flags + misaligned-access check
 tools/build-all.sh
 tools/setup-toolchain.sh   download CeGCC (Linux)
@@ -49,6 +53,8 @@ export ZUNE=192.168.1.208 JF="192.168.1.156 8096" JFKEY=your-jellyfin-api-key
 tools/zf push build/jflaunch.dll build/jfplay.exe
 tools/zf play          # one random song
 tools/zf album         # a random album (or: tools/zf album ALBUM_ID)
+tools/zf serve         # browse server: open http://127.0.0.1:8090 in the Zune browser
+tools/zf install       # install as a Lyra mod so the server starts at boot
 tools/zf log
 ```
 

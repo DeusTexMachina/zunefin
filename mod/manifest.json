@@ -1,0 +1,29 @@
+{
+  "mod_id": "zunefin",
+  "name": "ZuneFin",
+  "version": "0.1.0",
+  "author": "DeusTexMachina",
+  "category": "Media",
+  "description": "Jellyfin music for the Zune HD. Browse your server at http://127.0.0.1:8090 in the Zune browser and play albums through the native player.",
+  "requires": [
+    "lyra.wifi_awake",
+    "lyra.mod_runtime@1"
+  ],
+  "daemons": [
+    {
+      "binary": "@/jfplay.exe"
+    }
+  ],
+  "settings": [
+    {
+      "id": "wifi",
+      "type": "bool",
+      "label": "Keep Wi-Fi on for ZuneFin",
+      "default": true,
+      "persist": true,
+      "holds": [
+        "lyra.wifi_awake"
+      ]
+    }
+  ]
+}

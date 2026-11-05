@@ -52,8 +52,13 @@ static void flog(const char *fmt, ...) {
 }
 
 static char *o_buf; static int o_max, o_used;
-static HANDLE g_stop;   /* signalled when a newer jfplay wants us gone */
-static int stopping(void) { return g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0; }
+static HANDLE g_stop;       /* signalled when a newer jfplay wants us gone */
+static HANDLE g_play_stop;  /* signalled to cancel the current album playback (serve mode) */
+static int stopping(void) {
+    return (g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0) ||
+           (g_play_stop && WaitForSingleObject(g_play_stop, 0) == WAIT_OBJECT_0);
+}
+static char g_status[200] = "idle";   /* shown by the web pages */
 
 /* Write what we have so far to \flash2\zunefin-out.txt (album mode runs for minutes). */
 static void flush_out(void) {
@@ -316,7 +321,7 @@ static int q_set_order(HANDLE h, const DWORD *order, int n, int cur) {
 
 typedef struct { char id[40]; char name[160]; char artist[160]; int dur_ms; DWORD song; } Track;
 #define MAX_TRACKS 60
-static Track g_tr[MAX_TRACKS];
+static Track g_tr[MAX_TRACKS];   /* the album being played */
 
 /* Next top-level {...} object in an array at *pp; returns a malloc'd copy or NULL. */
 static char *json_next_obj(const char **pp) {
@@ -338,25 +343,27 @@ static char *json_next_obj(const char **pp) {
 }
 
 /* Pull each track's fields out of an Items array. */
-static int parse_tracks(const char *body) {
+static int parse_tracks_into(const char *body, Track *tr, int max) {
     const char *p = strstr(body, "\"Items\":["); int n = 0; char *obj;
     if (!p) return 0;
     p += 9;
-    while (n < MAX_TRACKS && (obj = json_next_obj(&p)) != NULL) {
-        if (json_str(obj, "Id", g_tr[n].id, sizeof g_tr[n].id)) {
+    while (n < max && (obj = json_next_obj(&p)) != NULL) {
+        if (json_str(obj, "Id", tr[n].id, sizeof tr[n].id)) {
             const char *ar = strstr(obj, "\"Artists\":[\"");
-            json_str(obj, "Name", g_tr[n].name, sizeof g_tr[n].name);
-            g_tr[n].dur_ms = json_ticks_ms(obj);
-            g_tr[n].artist[0] = 0;
-            if (ar) json_decode(ar + 12, g_tr[n].artist, sizeof g_tr[n].artist);
-            if (!g_tr[n].artist[0]) json_str(obj, "AlbumArtist", g_tr[n].artist, sizeof g_tr[n].artist);
-            g_tr[n].song = 0;
+            json_str(obj, "Name", tr[n].name, sizeof tr[n].name);
+            tr[n].dur_ms = json_ticks_ms(obj);
+            tr[n].artist[0] = 0;
+            if (ar) json_decode(ar + 12, tr[n].artist, sizeof tr[n].artist);
+            if (!tr[n].artist[0]) json_str(obj, "AlbumArtist", tr[n].artist, sizeof tr[n].artist);
+            tr[n].song = 0;
             n++;
         }
         free(obj);
     }
     return n;
 }
+
+static int parse_tracks(const char *body) { return parse_tracks_into(body, g_tr, MAX_TRACKS); }
 
 static void track_path(const Track *t, wchar_t *out) {
     wchar_t wid[48];
@@ -380,16 +387,16 @@ static void attach_art(DWORD song, const wchar_t *art) {
     if (CopyFileW(art, file, FALSE)) ZDK_SETINT((void *)song, 0x10008, 1);
 }
 
-static void album_mode(const char *host, int port, const char *key, const char *album_in) {
+static void album_play(const char *host, int port, const char *key, const char *album_in, const char *start_id) {
     char path[600], album_id[64] = "", album[160] = "", album_artist[160] = "";
-    char *body; int status, n, k, have_art = 0, queued = 0;
+    char *body; int status, n, k, j, have_art = 0, queued = 0;
     HMODULE zdk; PlaySongFromUrlFn play; HANDLE q = NULL;
     static wchar_t wt[200], wp[MAX_PATH], wa[160], wb[160];
-    DWORD order[MAX_TRACKS]; int m = 0;
+    DWORD order[MAX_TRACKS]; int m = 0, st = 0, cur = 0;
     const wchar_t *ART = L"\\flash2\\zunefin\\art.jpg";
 
     /* 1. which album */
-    if (album_in && album_in[0])
+    if (album_in && album_in[0] && strcmp(album_in, "random") != 0)
         _snprintf(path, sizeof path, "/Items?Ids=%s&api_key=%s", album_in, key);
     else
         _snprintf(path, sizeof path, "/Items?IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=Random&Limit=10&Fields=ChildCount&EnableImages=false&EnableUserData=false&api_key=%s", key);
@@ -401,7 +408,7 @@ static void album_mode(const char *host, int port, const char *key, const char *
         if (p) p += 9;
         while (p && (obj = json_next_obj(&p)) != NULL) {
             const char *cc = strstr(obj, "\"ChildCount\":");
-            int good = (album_in && album_in[0]) || (cc && atoi(cc + 13) >= 3);
+            int good = (album_in && album_in[0] && strcmp(album_in, "random") != 0) || (cc && atoi(cc + 13) >= 3);
             if (first || good) {
                 json_str(obj, "Id", album_id, sizeof album_id); json_str(obj, "Name", album, sizeof album);
                 json_str(obj, "AlbumArtist", album_artist, sizeof album_artist);
@@ -427,6 +434,8 @@ static void album_mode(const char *host, int port, const char *key, const char *
     say("album: %s - %s (%d tracks)\r\n", album_artist, album, n);
     if (n == 0) return;
     for (k = 0; k < n; k++) say("  %2d. %s (%d:%02d)\r\n", k + 1, g_tr[k].name, g_tr[k].dur_ms / 60000, (g_tr[k].dur_ms / 1000) % 60);
+    if (start_id && start_id[0]) for (k = 0; k < n; k++) if (!strcmp(g_tr[k].id, start_id)) { st = k; break; }
+    _snprintf(g_status, sizeof g_status, "Loading %s - %s", album_artist, g_tr[st].name);
 
     clean_cache();
 
@@ -434,7 +443,7 @@ static void album_mode(const char *host, int port, const char *key, const char *
     {
         char ap[300]; int ast; long ag;
         const char *src_id[2]; int t;
-        src_id[0] = album_id; src_id[1] = g_tr[0].id;      /* album cover, else track 1's embedded art */
+        src_id[0] = album_id; src_id[1] = g_tr[st].id;     /* album cover, else the track's embedded art */
         for (t = 0; t < 2 && !have_art; t++) {
             _snprintf(ap, sizeof ap, "/Items/%s/Images/Primary?maxWidth=300&maxHeight=300&format=Jpg&quality=90&api_key=%s", src_id[t], key);
             ag = http_download(host, port, ap, ART, &ast);
@@ -444,23 +453,25 @@ static void album_mode(const char *host, int port, const char *key, const char *
         if (!have_art) DeleteFileW(ART);
     }
     {
-        DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[0]);
-        flog("dl 1/%d: %ld bytes in %lu ms", n, got, GetTickCount() - t0);
-        if (got <= 0) { say("download of track 1 failed\r\n"); return; }
+        DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[st]);
+        flog("dl %d/%d: %ld bytes in %lu ms", st + 1, n, got, GetTickCount() - t0);
+        if (got <= 0) { say("download of track %d failed\r\n", st + 1); _snprintf(g_status, sizeof g_status, "Download failed"); return; }
     }
 
     /* 4. play track 1 */
     zdk = LoadLibraryW(L"zdksystem.dll");
     play = zdk ? (PlaySongFromUrlFn)GetProcAddress(zdk, L"ZDKMedia_Queue_PlaySongFromURL") : NULL;
     if (!play) { say("PlaySongFromURL missing\r\n"); return; }
-    MultiByteToWideChar(CP_UTF8, 0, g_tr[0].name, -1, wt, 200);
-    track_path(&g_tr[0], wp);
+    if (stopping()) return;
+    MultiByteToWideChar(CP_UTF8, 0, g_tr[st].name, -1, wt, 200);
+    track_path(&g_tr[st], wp);
     status = play(wt, wp);
-    flog("play: track 1 returned 0x%08x", status);
-    if (status < 0) { say("player refused track 1 (0x%08x)\r\n", status); return; }
+    flog("play: track %d returned 0x%08x", st + 1, status);
+    if (status < 0) { say("player refused track %d (0x%08x)\r\n", st + 1, status); return; }
     Sleep(300);
-    set_meta(zdk, have_art ? ART : NULL, g_tr[0].dur_ms, g_tr[0].artist, album);
-    say("playing track 1\r\n");
+    set_meta(zdk, have_art ? ART : NULL, g_tr[st].dur_ms, g_tr[st].artist, album);
+    say("playing track %d\r\n", st + 1);
+    _snprintf(g_status, sizeof g_status, "Playing %s - %s", album_artist, album);
 
     /* 5. create + queue tracks 2..n now; their files download below */
     MultiByteToWideChar(CP_UTF8, 0, album, -1, wb, 160);
@@ -469,9 +480,9 @@ static void album_mode(const char *host, int port, const char *key, const char *
         for (tries = 0; tries < 40; tries++) { c = q_count(q); if (c >= 1) break; Sleep(100); }
         flog("queue: count %d after %d tries", c, tries);
         if (c >= 1) {
-            order[m++] = 0;                          /* track 1 sits at storage 0 */
-            for (k = 1; k < n; k++) {
+            for (k = 0; k < n; k++) {
                 DWORD id = 0; int si;
+                if (k == st) { cur = m; order[m++] = 0; continue; }   /* playing song sits at storage 0 */
                 if (CREATE_SONG(0xfd, &id) < 0 || !id) { flog("queue: create failed at %d", k + 1); break; }
                 MultiByteToWideChar(CP_UTF8, 0, g_tr[k].name, -1, wt, 200);
                 MultiByteToWideChar(CP_UTF8, 0, g_tr[k].artist, -1, wa, 160);
@@ -486,13 +497,13 @@ static void album_mode(const char *host, int port, const char *key, const char *
                 order[m++] = (DWORD)si;
                 g_tr[k].song = id;
             }
-            if (m > 1 && q_set_order(q, order, m, 0) == 0) {
+            if (m > 1 && q_set_order(q, order, m, cur) == 0) {
                 MoveToFn mv = (MoveToFn)GetProcAddress(zdk, L"ZDKMedia_Queue_MoveTo");
                 queued = m;
-                flog("queue: %d songs queued", m);
-                if (mv) mv(0);   /* sync the live cursor (proven YouTube-mod sequence) */
+                flog("queue: %d songs queued, cursor %d", m, cur);
+                if (mv) mv(cur);   /* sync the live cursor (proven YouTube-mod sequence) */
             }
-            if (have_art) for (k = 1; k < m; k++) if (g_tr[k].song) attach_art(g_tr[k].song, ART);
+            if (have_art) for (k = 0; k < n; k++) if (g_tr[k].song) attach_art(g_tr[k].song, ART);
         }
         CloseHandle(q);
     }
@@ -501,13 +512,17 @@ static void album_mode(const char *host, int port, const char *key, const char *
     flush_out();
 
     /* 6. download the rest in order, well ahead of playback (~5x real time) */
-    for (k = 1; k < n && !stopping(); k++) {
-        DWORD t0 = GetTickCount(); long got = download_track(host, port, key, &g_tr[k]);
+    for (j = 1; j < n && !stopping(); j++) {
+        DWORD t0; long got;
+        k = (st + j) % n;
+        _snprintf(g_status, sizeof g_status, "Playing %s - %s (downloading %d of %d)", album_artist, album, j + 1, n);
+        t0 = GetTickCount(); got = download_track(host, port, key, &g_tr[k]);
         flog("dl %d/%d: %ld bytes in %lu ms", k + 1, n, got, GetTickCount() - t0);
         if (got <= 0) say("download of track %d failed\r\n", k + 1);
     }
     if (stopping()) { flog("stopped by a newer jfplay"); say("stopped: a newer jfplay took over\r\n"); return; }
     say("all %d tracks downloaded\r\n", n);
+    _snprintf(g_status, sizeof g_status, "Playing %s - %s (all downloaded)", album_artist, album);
 }
 
 static int run(const void *arg, int arg_len, void *out, int out_max, int *out_used) {
@@ -526,7 +541,7 @@ static int run(const void *arg, int arg_len, void *out, int out_max, int *out_us
     sscanf(a, "%63s %d %79s %15s %63s", host, &port, key, mode, item);
     flog("args: host=%s port=%d mode=%s item=%s", host, port, mode, item);
     if (!host[0] || !key[0]) { say("usage: --arg \"<ip> <port> <api_key> [fileurl|album|file|mp3|static|aac|url] [item_id]\"\r\n"); goto done; }
-    if (!strcmp(mode, "album")) { album_mode(host, port, key, item); goto done; }
+    if (!strcmp(mode, "album")) { album_play(host, port, key, item, NULL); goto done; }
 
     /* 1. pick a song */
     if (item[0]) {
@@ -645,9 +660,14 @@ done:
 }
 
 #ifdef JF_EXE
-/* Standalone program: same run(), output goes to \flash2\zunefin-out.txt. */
+#include "serve.inc.c"
+
+/* Standalone program.
+ *   jfplay.exe <ip> <port> <key> serve   save settings, then run the browse server
+ *   jfplay.exe                           (Lyra boot daemon) run the server from saved settings
+ *   jfplay.exe <ip> <port> <key> <mode> [id]   one-shot test modes, output to zunefin-out.txt */
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show) {
-    static char outbuf[8192]; char args[512]; int used = 0; WSADATA wsa;
+    static char outbuf[8192]; char args[512], mode[16] = ""; int used = 0; WSADATA wsa;
     HANDLE h; DWORD w;
     HANDLE mtx;
     (void)hi; (void)hp; (void)show;
@@ -655,16 +675,25 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show) {
     g_stop = CreateEventW(NULL, TRUE, FALSE, L"ZuneFinStop");
     mtx = CreateMutexW(NULL, FALSE, L"ZuneFinPlayer");
     if (GetLastError() == ERROR_ALREADY_EXISTS) SetEvent(g_stop);
-    if (mtx && WaitForSingleObject(mtx, 15000) == WAIT_TIMEOUT) return 2;
+    if (mtx && WaitForSingleObject(mtx, 30000) == WAIT_TIMEOUT) return 2;
     ResetEvent(g_stop);
     DeleteFileW(L"\\flash2\\zunefin.log");
     flog("exe started");
-    WideCharToMultiByte(CP_UTF8, 0, cmdline, -1, args, sizeof args, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, cmdline ? cmdline : L"", -1, args, sizeof args, NULL, NULL);
     if (WSAStartup(MAKEWORD(2, 2), &wsa)) { flog("WSAStartup failed"); return 1; }
+
+    sscanf(args, "%*s %*d %*s %15s", mode);
+    if (!args[0] || !strcmp(mode, "serve")) {
+        if (args[0] && sscanf(args, "%63s %d %79s", g_host, &g_port, g_key) == 3) save_config();
+        else if (!load_config()) { flog("serve: no settings (run: zf serve once)"); goto out; }
+        serve_main();
+        goto out;
+    }
     run(args, (int)strlen(args), outbuf, sizeof outbuf, &used);
-    WSACleanup();
     h = CreateFileW(L"\\flash2\\zunefin-out.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) { WriteFile(h, outbuf, used, &w, NULL); CloseHandle(h); }
+out:
+    WSACleanup();
     flog("exe finished");
     if (mtx) { ReleaseMutex(mtx); CloseHandle(mtx); }
     return 0;

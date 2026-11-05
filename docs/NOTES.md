@@ -96,3 +96,21 @@ downloaded part gives "cannot be played".
 
 Only one jfplay runs at a time (mutex `ZuneFinPlayer`, stop event `ZuneFinStop`).
 A running `.exe` is locked on Windows CE, so restart the Zune if a push fails.
+
+## Browse server
+
+`jfplay.exe <ip> <port> <key> serve` saves the settings to
+`\flash2\zunefin\config.txt` and serves HTML on port 8090. Started with no
+arguments (as Lyra's boot daemon does), it reads that file. The pages are plain
+HTML for IE Mobile 6. Cover thumbnails go through `/img`, so the API key never
+reaches the browser. `/play?album=ID[&track=ID]` cancels any current playback
+and starts `album_play()` on a worker thread. `/quit` stops the server; a
+running `.exe` can't be overwritten, so `zf push` and `zf install` call it first.
+
+The mod manifest declares the daemon and a "Keep Wi-Fi on" setting that holds
+`lyra.wifi_awake`. A freshly deployed mod starts disabled: enable it in the
+Mods tab and restart.
+
+Host test: `serve.inc.c` compiles on Linux with a tiny Win32 shim and runs
+against a fake Jellyfin. Note that real Jellyfin JSON is compact (`"Items":[`),
+and the parser relies on that.
